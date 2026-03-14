@@ -441,7 +441,7 @@ def build_graph():
                     graph_id,
                     chunks,
                     ontology,
-                    batch_size=3,
+                    batch_size=10,
                     progress_callback=add_progress_callback
                 )
                 

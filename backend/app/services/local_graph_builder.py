@@ -8,6 +8,7 @@ import uuid
 import json
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -274,15 +275,14 @@ class LocalGraphBuilderService:
         graph_id: str,
         chunks: List[str],
         ontology: Dict[str, Any],
-        batch_size: int = 3,
+        batch_size: int = 10,
         progress_callback: Optional[Callable] = None,
         collected_facts: Optional[List[str]] = None,
     ) -> List[str]:
         """
         分批提取实体/关系并写入 Neo4j + ChromaDB。
-        Returns: batch ID 列表（与 Zep episode_uuid 列表对应）
+        5个并发LLM提取 + 完成即写入DB。
         """
-        meta = _load_meta(graph_id) or {}
         valid_entity_types = {e["name"] for e in ontology.get("entity_types", [])}
         valid_edge_types = {e["name"] for e in ontology.get("edge_types", [])}
 
@@ -291,125 +291,115 @@ class LocalGraphBuilderService:
         total_nodes_created = 0
         total_edges_created = 0
 
-        # 缓存已有实体名称（用于去重）
-        existing_names: Dict[str, str] = {}  # name_lower -> uuid
-        existing_records = run_query(
+        existing_names: Dict[str, str] = {}
+        for rec in run_query(
             "MATCH (n:Entity {graph_id: $g}) RETURN n.uuid AS uuid, n.name AS name",
             {"g": graph_id},
-        )
-        for rec in existing_records:
+        ):
             if rec["name"]:
                 existing_names[rec["name"].lower()] = rec["uuid"]
 
-        for i in range(0, total_chunks, batch_size):
-            batch_chunks = chunks[i:i + batch_size]
-            batch_num = i // batch_size + 1
-            total_batches = (total_chunks + batch_size - 1) // batch_size
+        total_batches = (total_chunks + batch_size - 1) // batch_size
+        batch_list = [
+            (idx, chunks[i:i + batch_size])
+            for idx, i in enumerate(range(0, total_chunks, batch_size), start=1)
+        ]
+        completed_count = 0
+        write_lock = threading.Lock()
 
-            if progress_callback:
-                progress = (i + len(batch_chunks)) / total_chunks
-                progress_callback(
-                    f"处理第 {batch_num}/{total_batches} 批数据 ({len(batch_chunks)} 块)...",
-                    progress,
-                )
+        def _extract_batch(batch_num, batch_chunks):
+            combined = "\n\n---\n\n".join(batch_chunks)
+            return batch_num, self._extractor.extract(combined, ontology)
 
+        def _write_batch(batch_num, extracted):
+            nonlocal total_nodes_created, total_edges_created, completed_count
             batch_id = f"batch_{graph_id}_{batch_num}"
-            facts_to_embed: List[Dict[str, Any]] = []
+            facts_to_embed = []
+            entities = extracted.get("entities", [])
+            relationships = extracted.get("relationships", [])
+            chunk_entity_map = {}
 
-            for chunk in batch_chunks:
-                extracted = self._extractor.extract(chunk, ontology)
-                entities = extracted.get("entities", [])
-                relationships = extracted.get("relationships", [])
+            for ent in entities:
+                if not isinstance(ent, dict):
+                    continue
+                ent_name = (ent.get("name") or "").strip()
+                ent_type = (ent.get("type") or "").strip()
+                if not ent_name or ent_type not in valid_entity_types:
+                    continue
+                name_key = ent_name.lower()
+                if name_key in existing_names:
+                    ent_uuid = existing_names[name_key]
+                else:
+                    ent_uuid = uuid.uuid4().hex
+                    existing_names[name_key] = ent_uuid
+                    total_nodes_created += 1
+                attrs_json = json.dumps(ent.get("attributes", {}), ensure_ascii=False)
+                safe_ent_type = validate_rel_type(ent_type)
+                cypher = (
+                    "MERGE (n:Entity {uuid: $uuid}) "
+                    "ON CREATE SET n.created_at = $updated_at "
+                    f"SET n:{safe_ent_type}, n.graph_id = $graph_id, "
+                    "n.name = $name, n.summary = $summary, "
+                    "n.attributes = $attributes, n.updated_at = $updated_at "
+                    "RETURN n.uuid AS uuid"
+                )
+                run_write(cypher, {
+                    "uuid": ent_uuid,
+                    "graph_id": graph_id,
+                    "name": ent_name,
+                    "summary": (ent.get("summary") or ""),
+                    "attributes": attrs_json,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                })
+                chunk_entity_map[ent_name] = ent_uuid
 
-                # --- 写入实体节点 ---
-                chunk_entity_map: Dict[str, str] = {}  # name -> uuid
-                for ent in entities:
-                    ent_name = (ent.get("name") or "").strip()
-                    ent_type = (ent.get("type") or "").strip()
-                    if not ent_name or ent_type not in valid_entity_types:
-                        continue
-
-                    name_key = ent_name.lower()
-                    if name_key in existing_names:
-                        ent_uuid = existing_names[name_key]
-                    else:
-                        ent_uuid = uuid.uuid4().hex
-                        existing_names[name_key] = ent_uuid
-                        total_nodes_created += 1
-
-                    attrs_json = json.dumps(ent.get("attributes", {}), ensure_ascii=False)
-                    cypher = (
-                        f"MERGE (n:Entity:{ent_type} {{uuid: $uuid}}) "
-                        "ON CREATE SET n.created_at = $updated_at "
-                        "SET n.graph_id = $graph_id, "
-                        "n.name = $name, "
-                        "n.summary = $summary, "
-                        "n.attributes = $attributes, "
-                        "n.updated_at = $updated_at "
-                        "RETURN n.uuid AS uuid"
-                    )
-                    run_write(cypher, {
-                        "uuid": ent_uuid,
+            for rel in relationships:
+                if not isinstance(rel, dict):
+                    continue
+                src_name = (rel.get("source") or "").strip()
+                tgt_name = (rel.get("target") or "").strip()
+                rel_type = (rel.get("type") or "").strip()
+                fact = (rel.get("fact") or "").strip()
+                if not src_name or not tgt_name or not fact:
+                    continue
+                if rel_type not in valid_edge_types:
+                    continue
+                src_uuid = chunk_entity_map.get(src_name) or existing_names.get(src_name.lower())
+                tgt_uuid = chunk_entity_map.get(tgt_name) or existing_names.get(tgt_name.lower())
+                if not src_uuid or not tgt_uuid:
+                    continue
+                rel_uuid = uuid.uuid4().hex
+                now = datetime.now(timezone.utc).isoformat()
+                create_relationship(src_uuid, tgt_uuid, validate_rel_type(rel_type), {
+                    "uuid": rel_uuid,
+                    "graph_id": graph_id,
+                    "name": rel_type,
+                    "fact": fact,
+                    "valid_at": now,
+                    "invalid_at": None,
+                    "expired_at": None,
+                    "round_num": -1,
+                    "episode_source": batch_id,
+                })
+                total_edges_created += 1
+                facts_to_embed.append({
+                    "id": rel_uuid,
+                    "text": fact,
+                    "metadata": {
                         "graph_id": graph_id,
-                        "name": ent_name,
-                        "summary": (ent.get("summary") or ""),
-                        "attributes": attrs_json,
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                    })
-                    chunk_entity_map[ent_name] = ent_uuid
-
-                # --- 写入关系边 ---
-                for rel in relationships:
-                    src_name = (rel.get("source") or "").strip()
-                    tgt_name = (rel.get("target") or "").strip()
-                    rel_type = (rel.get("type") or "").strip()
-                    fact = (rel.get("fact") or "").strip()
-
-                    if not src_name or not tgt_name or not fact:
-                        continue
-                    if rel_type not in valid_edge_types:
-                        continue
-
-                    src_uuid = chunk_entity_map.get(src_name) or existing_names.get(src_name.lower())
-                    tgt_uuid = chunk_entity_map.get(tgt_name) or existing_names.get(tgt_name.lower())
-                    if not src_uuid or not tgt_uuid:
-                        continue
-
-                    rel_uuid = uuid.uuid4().hex
-                    now = datetime.now(timezone.utc).isoformat()
-                    safe_type = validate_rel_type(rel_type)
-                    create_relationship(src_uuid, tgt_uuid, safe_type, {
-                        "uuid": rel_uuid,
-                        "graph_id": graph_id,
-                        "name": rel_type,
-                        "fact": fact,
+                        "edge_uuid": rel_uuid,
+                        "source_name": src_name,
+                        "target_name": tgt_name,
+                        "rel_type": rel_type,
                         "valid_at": now,
-                        "invalid_at": None,
-                        "expired_at": None,
+                        "invalid_at": "",
                         "round_num": -1,
-                        "episode_source": batch_id,
-                    })
-                    total_edges_created += 1
+                        "doc_type": "edge_fact",
+                    },
+                })
+                if collected_facts is not None:
+                    collected_facts.append(fact)
 
-                    facts_to_embed.append({
-                        "id": rel_uuid,
-                        "text": fact,
-                        "metadata": {
-                            "graph_id": graph_id,
-                            "edge_uuid": rel_uuid,
-                            "source_name": src_name,
-                            "target_name": tgt_name,
-                            "rel_type": rel_type,
-                            "valid_at": now,
-                            "invalid_at": "",
-                            "round_num": -1,
-                            "doc_type": "edge_fact",
-                        },
-                    })
-                    if collected_facts is not None:
-                        collected_facts.append(fact)
-
-            # --- 批量嵌入并写入 ChromaDB ---
             if facts_to_embed:
                 texts = [f["text"] for f in facts_to_embed]
                 embeddings = embed_batch(texts)
@@ -418,8 +408,24 @@ class LocalGraphBuilderService:
                 upsert_facts(facts_to_embed)
 
             batch_ids.append(batch_id)
+            completed_count += 1
+            if progress_callback:
+                progress_callback(
+                    f"提取并写入 {completed_count}/{total_batches} 批...",
+                    completed_count / total_batches * 0.9,
+                )
 
-        # 更新元数据统计
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {pool.submit(_extract_batch, bn, bc): bn for bn, bc in batch_list}
+            for fut in as_completed(futures):
+                try:
+                    batch_num, extracted = fut.result()
+                except Exception as e:
+                    logger.warning(f"批次 {futures[fut]} 提取异常: {e}")
+                    continue
+                with write_lock:
+                    _write_batch(batch_num, extracted)
+
         meta = _load_meta(graph_id) or {}
         meta["node_count"] = meta.get("node_count", 0) + total_nodes_created
         meta["edge_count"] = meta.get("edge_count", 0) + total_edges_created
