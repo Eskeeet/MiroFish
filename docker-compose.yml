@@ -1,4 +1,16 @@
 services:
+  neo4j:
+    image: neo4j:5-community
+    container_name: mirofish-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/mirofish
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - ./neo4j_data:/data
+    restart: unless-stopped
+
   mirofish:
     image: ghcr.io/666ghj/mirofish:latest
     # 加速镜像（如拉取缓慢可替换上方地址）
@@ -10,5 +22,7 @@ services:
       - "3000:3000"
       - "5001:5001"
     restart: unless-stopped
+    depends_on:
+      - neo4j
     volumes:
       - ./backend/uploads:/app/backend/uploads

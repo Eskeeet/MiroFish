@@ -498,3 +498,9 @@ class GraphBuilderService:
         """删除图谱"""
         self.client.graph.delete(graph_id=graph_id)
 
+
+# ---------------------------------------------------------------------------
+# 使用本地实现替代 Zep Cloud
+# ---------------------------------------------------------------------------
+from .local_graph_builder import LocalGraphBuilderService  # noqa: E402
+GraphBuilderService = LocalGraphBuilderService
