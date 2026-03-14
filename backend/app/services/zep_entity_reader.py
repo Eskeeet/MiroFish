@@ -411,19 +411,19 @@ class ZepEntityReader:
             return None
     
     def get_entities_by_type(
-        self, 
-        graph_id: str, 
+        self,
+        graph_id: str,
         entity_type: str,
         enrich_with_edges: bool = True
     ) -> List[EntityNode]:
         """
         获取指定类型的所有实体
-        
+
         Args:
             graph_id: 图谱ID
             entity_type: 实体类型（如 "Student", "PublicFigure" 等）
             enrich_with_edges: 是否获取相关边信息
-            
+
         Returns:
             实体列表
         """
@@ -435,3 +435,8 @@ class ZepEntityReader:
         return result.entities
 
 
+# ---------------------------------------------------------------------------
+# 使用本地实现替代 Zep Cloud
+# ---------------------------------------------------------------------------
+from .local_entity_reader import LocalEntityReader  # noqa: E402
+ZepEntityReader = LocalEntityReader

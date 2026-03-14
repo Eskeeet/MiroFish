@@ -1733,3 +1733,10 @@ class ZepToolsService:
             logger.warning(f"生成采访摘要失败: {e}")
             # 降级：简单拼接
             return f"共采访了{len(interviews)}位受访者，包括：" + "、".join([i.agent_name for i in interviews])
+
+
+# ---------------------------------------------------------------------------
+# 使用本地实现替代 Zep Cloud
+# ---------------------------------------------------------------------------
+from .local_tools import LocalToolsService  # noqa: E402
+ZepToolsService = LocalToolsService
