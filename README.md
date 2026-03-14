@@ -20,7 +20,7 @@
 [![X](https://img.shields.io/badge/X-Follow-000000?style=flat-square&logo=x&logoColor=white)](https://x.com/mirofish_ai)
 [![Instagram](https://img.shields.io/badge/Instagram-Follow-E4405F?style=flat-square&logo=instagram&logoColor=white)](https://www.instagram.com/mirofish_ai/)
 
-[English](./README.md) | [中文文档](./README-ZH.md)
+[English](./README.md) | [中文文档](./README-zh.md)
 
 </div>
 
@@ -102,6 +102,7 @@ Click the image to watch MiroFish's deep prediction of the lost ending based on 
 | **Node.js** | 18+ | Frontend runtime, includes npm | `node -v` |
 | **Python** | ≥3.11, ≤3.12 | Backend runtime | `python --version` |
 | **uv** | Latest | Python package manager | `uv --version` |
+| **Docker** | Latest | Runs Neo4j graph database | `docker -v` |
 
 #### 1. Configure Environment Variables
 
@@ -122,9 +123,10 @@ LLM_API_KEY=your_api_key
 LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 LLM_MODEL_NAME=qwen-plus
 
-# Zep Cloud Configuration
-# Free monthly quota is sufficient for simple usage: https://app.getzep.com/
-ZEP_API_KEY=your_zep_api_key
+# Neo4j Graph Database Configuration (started automatically via Docker)
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=mirofish
 ```
 
 #### 2. Install Dependencies
@@ -162,17 +164,26 @@ npm run backend   # Start backend only
 npm run frontend  # Start frontend only
 ```
 
+#### 3a. Start Neo4j (required before running the app)
+
+```bash
+# Start Neo4j graph database in the background
+docker compose up -d neo4j
+```
+
+Neo4j browser is available at `http://localhost:7474` (user: `neo4j`, password: `mirofish`)
+
 ### Option 2: Docker Deployment
 
 ```bash
 # 1. Configure environment variables (same as source deployment)
 cp .env.example .env
 
-# 2. Pull image and start
+# 2. Pull image and start (includes Neo4j)
 docker compose up -d
 ```
 
-Reads `.env` from root directory by default, maps ports `3000 (frontend) / 5001 (backend)`
+Reads `.env` from root directory by default, maps ports `3000 (frontend) / 5001 (backend) / 7474 (Neo4j browser) / 7687 (Neo4j bolt)`
 
 > Mirror address for faster pulling is provided as comments in `docker-compose.yml`, replace if needed.
 

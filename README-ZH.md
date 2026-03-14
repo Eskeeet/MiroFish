@@ -102,6 +102,7 @@ MiroFish 致力于打造映射现实的群体智能镜像，通过捕捉个体�
 | **Node.js** | 18+ | 前端运行环境，包含 npm | `node -v` |
 | **Python** | ≥3.11, ≤3.12 | 后端运行环境 | `python --version` |
 | **uv** | 最新版 | Python 包管理器 | `uv --version` |
+| **Docker** | 最新版 | 运行 Neo4j 图数据库 | `docker -v` |
 
 #### 1. 配置环境变量
 
@@ -122,9 +123,10 @@ LLM_API_KEY=your_api_key
 LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 LLM_MODEL_NAME=qwen-plus
 
-# Zep Cloud 配置
-# 每月免费额度即可支撑简单使用：https://app.getzep.com/
-ZEP_API_KEY=your_zep_api_key
+# Neo4j 图数据库配置（通过 Docker 自动启动）
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=mirofish
 ```
 
 #### 2. 安装依赖
@@ -162,17 +164,26 @@ npm run backend   # 仅启动后端
 npm run frontend  # 仅启动前端
 ```
 
+#### 3a. 启动 Neo4j（运行应用前必须先启动）
+
+```bash
+# 在后台启动 Neo4j 图数据库
+docker compose up -d neo4j
+```
+
+Neo4j 浏览器地址：`http://localhost:7474`（用户名：`neo4j`，密码：`mirofish`）
+
 ### 二、Docker 部署
 
 ```bash
 # 1. 配置环境变量（同源码部署）
 cp .env.example .env
 
-# 2. 拉取镜像并启动
+# 2. 拉取镜像并启动（含 Neo4j）
 docker compose up -d
 ```
 
-默认会读取根目录下的 `.env`，并映射端口 `3000（前端）/5001（后端）`
+默认会读取根目录下的 `.env`，并映射端口 `3000（前端）/5001（后端）/7474（Neo4j 浏览器）/7687（Neo4j Bolt）`
 
 > 在 `docker-compose.yml` 中已通过注释提供加速镜像地址，可按需替换
 
