@@ -549,6 +549,14 @@ class ZepGraphMemoryManager:
     def get_all_stats(cls) -> Dict[str, Dict[str, Any]]:
         """获取所有更新器的统计信息"""
         return {
-            sim_id: updater.get_stats() 
+            sim_id: updater.get_stats()
             for sim_id, updater in cls._updaters.items()
         }
+
+
+# ---------------------------------------------------------------------------
+# 使用本地实现替代 Zep Cloud
+# ---------------------------------------------------------------------------
+from .local_graph_memory_updater import LocalGraphMemoryUpdater, LocalGraphMemoryManager  # noqa: E402
+ZepGraphMemoryUpdater = LocalGraphMemoryUpdater
+ZepGraphMemoryManager = LocalGraphMemoryManager
