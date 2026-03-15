@@ -1,9 +1,10 @@
 """
 文件解析工具
-支持PDF、Markdown、TXT文件的文本提取
+支持PDF、Markdown、TXT、XML文件的文本提取
 """
 
 import os
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import List, Optional
 
@@ -61,7 +62,7 @@ def _read_text_with_fallback(file_path: str) -> str:
 class FileParser:
     """文件解析器"""
     
-    SUPPORTED_EXTENSIONS = {'.pdf', '.md', '.markdown', '.txt'}
+    SUPPORTED_EXTENSIONS = {'.pdf', '.md', '.markdown', '.txt', '.xml'}
     
     @classmethod
     def extract_text(cls, file_path: str) -> str:
@@ -90,7 +91,9 @@ class FileParser:
             return cls._extract_from_md(file_path)
         elif suffix == '.txt':
             return cls._extract_from_txt(file_path)
-        
+        elif suffix == '.xml':
+            return cls._extract_from_xml(file_path)
+
         raise ValueError(f"无法处理的文件格式: {suffix}")
     
     @staticmethod
@@ -119,7 +122,79 @@ class FileParser:
     def _extract_from_txt(file_path: str) -> str:
         """从TXT提取文本，支持自动编码检测"""
         return _read_text_with_fallback(file_path)
-    
+
+    @staticmethod
+    def _extract_from_xml(file_path: str) -> str:
+        """
+        从XML文件提取文本，使用流式解析支持大文件。
+        自动检测Wikipedia XML dump格式，提取文章标题和正文。
+        对于普通XML，递归提取所有文本内容。
+        """
+        is_mediawiki = False
+        try:
+            for event, elem in ET.iterparse(file_path, events=('start',)):
+                local_tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+                if local_tag == 'mediawiki':
+                    is_mediawiki = True
+                break
+        except ET.ParseError:
+            pass
+
+        if is_mediawiki:
+            return FileParser._extract_mediawiki_xml(file_path)
+        else:
+            return FileParser._extract_generic_xml(file_path)
+
+    @staticmethod
+    def _extract_mediawiki_xml(file_path: str) -> str:
+        """
+        流式解析Wikipedia/MediaWiki XML dump。
+        提取每篇文章的标题和正文，适合1GB+大文件。
+        """
+        parts = []
+        current_title = None
+
+        for event, elem in ET.iterparse(file_path, events=('end',)):
+            tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+
+            if tag == 'title':
+                current_title = (elem.text or '').strip()
+            elif tag == 'text':
+                raw = (elem.text or '').strip()
+                if current_title and raw:
+                    parts.append(f"=== {current_title} ===\n{raw}")
+                elem.clear()
+            elif tag == 'page':
+                current_title = None
+                elem.clear()
+
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _extract_generic_xml(file_path: str) -> str:
+        """
+        解析普通XML文件，递归提取所有文本节点内容。
+        """
+        try:
+            tree = ET.parse(file_path)
+        except ET.ParseError as e:
+            raise ValueError(f"XML解析失败: {e}")
+
+        parts = []
+
+        def collect_text(elem):
+            text = (elem.text or '').strip()
+            tail = (elem.tail or '').strip()
+            if text:
+                parts.append(text)
+            for child in elem:
+                collect_text(child)
+            if tail:
+                parts.append(tail)
+
+        collect_text(tree.getroot())
+        return "\n".join(parts)
+
     @classmethod
     def extract_from_multiple(cls, file_paths: List[str]) -> str:
         """
