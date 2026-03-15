@@ -6,6 +6,7 @@
 import os
 import traceback
 import threading
+from pathlib import Path
 from flask import request, jsonify
 
 from . import graph_bp
@@ -166,40 +167,68 @@ def generate_ontology():
         
         # 获取上传的文件
         uploaded_files = request.files.getlist('files')
-        if not uploaded_files or all(not f.filename for f in uploaded_files):
+        has_uploads = uploaded_files and any(f.filename for f in uploaded_files)
+
+        # 获取本地文件路径（支持大文件，如1GB XML dump，逗号分隔）
+        local_paths_raw = request.form.get('file_paths', '')
+        local_paths = [p.strip() for p in local_paths_raw.split(',') if p.strip()] if local_paths_raw else []
+
+        if not has_uploads and not local_paths:
             return jsonify({
                 "success": False,
                 "error": t('api.requireFileUpload')
             }), 400
-        
+
         # 创建项目
         project = ProjectManager.create_project(name=project_name)
         project.simulation_requirement = simulation_requirement
         logger.info(f"创建项目: {project.project_id}")
-        
+
         # 保存文件并提取文本
         document_texts = []
         all_text = ""
-        
+
+        # 处理上传的文件
         for file in uploaded_files:
             if file and file.filename and allowed_file(file.filename):
                 # 保存文件到项目目录
                 file_info = ProjectManager.save_file_to_project(
-                    project.project_id, 
-                    file, 
+                    project.project_id,
+                    file,
                     file.filename
                 )
                 project.files.append({
                     "filename": file_info["original_filename"],
                     "size": file_info["size"]
                 })
-                
+
                 # 提取文本
                 text = FileParser.extract_text(file_info["path"])
                 text = TextProcessor.preprocess_text(text)
                 document_texts.append(text)
                 all_text += f"\n\n=== {file_info['original_filename']} ===\n{text}"
-        
+
+        # 处理本地文件路径（不复制文件，直接解析）
+        for local_path in local_paths:
+            path_obj = Path(local_path)
+            if not path_obj.exists():
+                logger.warning(f"本地文件不存在，跳过: {local_path}")
+                continue
+            ext = path_obj.suffix.lower().lstrip('.')
+            if ext not in Config.ALLOWED_EXTENSIONS:
+                logger.warning(f"不支持的文件格式，跳过: {local_path}")
+                continue
+            logger.info(f"解析本地文件: {local_path} ({path_obj.stat().st_size / 1024 / 1024:.1f} MB)")
+            text = FileParser.extract_text(local_path)
+            text = TextProcessor.preprocess_text(text)
+            document_texts.append(text)
+            all_text += f"\n\n=== {path_obj.name} ===\n{text}"
+            project.files.append({
+                "filename": path_obj.name,
+                "size": path_obj.stat().st_size,
+                "local_path": local_path
+            })
+
         if not document_texts:
             ProjectManager.delete_project(project.project_id)
             return jsonify({

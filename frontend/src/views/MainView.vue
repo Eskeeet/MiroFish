@@ -193,20 +193,23 @@ const initProject = async () => {
 
 const handleNewProject = async () => {
   const pending = getPendingUpload()
-  if (!pending.isPending || pending.files.length === 0) {
+  if (!pending.isPending || (pending.files.length === 0 && !pending.localPaths)) {
     error.value = 'No pending files found.'
     addLog('Error: No pending files found for new project.')
     return
   }
-  
+
   try {
     loading.value = true
     currentPhase.value = 0
     ontologyProgress.value = { message: 'Uploading and analyzing docs...' }
     addLog('Starting ontology generation: Uploading files...')
-    
+
     const formData = new FormData()
     pending.files.forEach(f => formData.append('files', f))
+    if (pending.localPaths) {
+      formData.append('file_paths', pending.localPaths)
+    }
     formData.append('simulation_requirement', pending.simulationRequirement)
     
     const res = await generateOntology(formData)

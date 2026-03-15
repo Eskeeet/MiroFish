@@ -145,7 +145,7 @@
                   ref="fileInput"
                   type="file"
                   multiple
-                  accept=".pdf,.md,.txt"
+                  accept=".pdf,.md,.txt,.xml"
                   @change="handleFileSelect"
                   style="display: none"
                   :disabled="loading"
@@ -164,6 +164,17 @@
                     <button @click.stop="removeFile(index)" class="remove-btn">×</button>
                   </div>
                 </div>
+              </div>
+
+              <!-- 本地大文件路径输入 -->
+              <div class="local-path-row">
+                <span class="local-path-label">本地文件路径（大文件）</span>
+                <input
+                  v-model="localPaths"
+                  class="local-path-input"
+                  placeholder="/path/to/file.xml"
+                  :disabled="loading"
+                />
               </div>
             </div>
 
@@ -227,6 +238,9 @@ const formData = ref({
 // 文件列表
 const files = ref([])
 
+// 本地大文件路径
+const localPaths = ref('')
+
 // 状态
 const loading = ref(false)
 const error = ref('')
@@ -237,7 +251,8 @@ const fileInput = ref(null)
 
 // 计算属性:是否可以提交
 const canSubmit = computed(() => {
-  return formData.value.simulationRequirement.trim() !== '' && files.value.length > 0
+  const hasInput = files.value.length > 0 || localPaths.value.trim() !== ''
+  return formData.value.simulationRequirement.trim() !== '' && hasInput
 })
 
 // 触发文件选择
@@ -276,7 +291,7 @@ const handleDrop = (e) => {
 const addFiles = (newFiles) => {
   const validFiles = newFiles.filter(file => {
     const ext = file.name.split('.').pop().toLowerCase()
-    return ['pdf', 'md', 'txt'].includes(ext)
+    return ['pdf', 'md', 'txt', 'xml'].includes(ext)
   })
   files.value.push(...validFiles)
 }
@@ -300,7 +315,7 @@ const startSimulation = () => {
   
   // 存储待上传的数据
   import('../store/pendingUpload.js').then(({ setPendingUpload }) => {
-    setPendingUpload(files.value, formData.value.simulationRequirement)
+    setPendingUpload(files.value, formData.value.simulationRequirement, localPaths.value.trim())
     
     // 立即跳转到Process页面（使用特殊标识表示新建项目）
     router.push({
@@ -692,6 +707,39 @@ const startSimulation = () => {
   font-family: var(--font-mono);
   font-size: 0.75rem;
   color: #666;
+}
+
+.local-path-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.local-path-label {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: #999;
+  white-space: nowrap;
+}
+
+.local-path-input {
+  flex: 1;
+  background: #FAFAFA;
+  border: 1px solid #E5E5E5;
+  padding: 6px 10px;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--black);
+  outline: none;
+}
+
+.local-path-input:focus {
+  border-color: #999;
+}
+
+.local-path-input::placeholder {
+  color: #CCC;
 }
 
 .upload-zone {
