@@ -22,8 +22,8 @@ from ..config import Config
 from ..utils.llm_client import LLMClient
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, t
-from .zep_tools import (
-    ZepToolsService, 
+from .local_tools import (
+    LocalToolsService,
     SearchResult, 
     InsightForgeResult, 
     PanoramaResult,
@@ -354,7 +354,7 @@ class ReportConsoleLogger:
         # 添加到 report_agent 相关的 logger
         loggers_to_attach = [
             'mirofish.report_agent',
-            'mirofish.zep_tools',
+            'mirofish.local_tools',
         ]
         
         for logger_name in loggers_to_attach:
@@ -370,7 +370,7 @@ class ReportConsoleLogger:
         if self._file_handler:
             loggers_to_detach = [
                 'mirofish.report_agent',
-                'mirofish.zep_tools',
+                'mirofish.local_tools',
             ]
             
             for logger_name in loggers_to_detach:
@@ -507,6 +507,18 @@ TOOL_DESC_PANORAMA_SEARCH = """\
 - 当前有效事实（模拟最新结果）
 - 历史/过期事实（演变记录）
 - 所有涉及的实体"""
+
+TOOL_DESC_TIMELINE_SEARCH = """\
+【时态检索 - 事实时间序列】
+按世界时间、模拟轮次和实体检索事实演变，每条结果包含：
+1. 事实开始成立与停止成立的时间
+2. 系统学到与淘汰该事实的时间
+3. 模拟轮次与原始 Episode 来源
+
+【使用场景】
+- 分析观点、偏好、关系或事件如何随轮次演变
+- 查看某个时间区间的状态转移
+- 区分当前事实与已失效的历史事实"""
 
 TOOL_DESC_QUICK_SEARCH = """\
 【简单搜索 - 快速检索】
@@ -711,6 +723,7 @@ SECTION_SYSTEM_PROMPT_TEMPLATE = """\
 【工具使用建议 - 请混合使用不同工具，不要只用一种】
 - insight_forge: 深度洞察分析，自动分解问题并多维度检索事实和关系
 - panorama_search: 广角全景搜索，了解事件全貌、时间线和演变过程
+- timeline_search: 按时间、轮次和实体追踪事实的状态转移
 - quick_search: 快速验证某个具体信息点
 - interview_agents: 采访模拟Agent，获取不同角色的第一人称观点和真实反应
 
@@ -887,7 +900,7 @@ class ReportAgent:
         simulation_id: str,
         simulation_requirement: str,
         llm_client: Optional[LLMClient] = None,
-        zep_tools: Optional[ZepToolsService] = None
+        zep_tools: Optional[LocalToolsService] = None
     ):
         """
         初始化Report Agent
@@ -897,14 +910,14 @@ class ReportAgent:
             simulation_id: 模拟ID
             simulation_requirement: 模拟需求描述
             llm_client: LLM客户端（可选）
-            zep_tools: Zep工具服务（可选）
+            zep_tools: 本地图谱工具服务（保留参数名以兼容旧调用）
         """
         self.graph_id = graph_id
         self.simulation_id = simulation_id
         self.simulation_requirement = simulation_requirement
         
         self.llm = llm_client or LLMClient()
-        self.zep_tools = zep_tools or ZepToolsService()
+        self.zep_tools = zep_tools or LocalToolsService()
         
         # 工具定义
         self.tools = self._define_tools()
@@ -933,6 +946,19 @@ class ReportAgent:
                 "parameters": {
                     "query": "搜索查询，用于相关性排序",
                     "include_expired": "是否包含过期/历史内容（默认True）"
+                }
+            },
+            "timeline_search": {
+                "name": "timeline_search",
+                "description": TOOL_DESC_TIMELINE_SEARCH,
+                "parameters": {
+                    "entity_uuid": "限定某个实体UUID（可选）",
+                    "relation_type": "限定关系类型（可选）",
+                    "start_time": "开始时间，UTC ISO-8601（可选）",
+                    "end_time": "结束时间，UTC ISO-8601（可选）",
+                    "round_from": "起始模拟轮次（可选）",
+                    "round_to": "结束模拟轮次（可选）",
+                    "limit": "返回数量（可选，默认200）"
                 }
             },
             "quick_search": {
@@ -1004,6 +1030,24 @@ class ReportAgent:
                     limit=limit
                 )
                 return result.to_text()
+
+            elif tool_name == "timeline_search":
+                def optional_int(name: str):
+                    value = parameters.get(name)
+                    return int(value) if value not in (None, "") else None
+
+                timeline = self.zep_tools.get_fact_timeline(
+                    graph_id=self.graph_id,
+                    entity_uuid=parameters.get("entity_uuid") or None,
+                    relation_type=parameters.get("relation_type") or None,
+                    start_time=parameters.get("start_time") or None,
+                    end_time=parameters.get("end_time") or None,
+                    round_from=optional_int("round_from"),
+                    round_to=optional_int("round_to"),
+                    include_historical=True,
+                    limit=optional_int("limit") or 200,
+                )
+                return json.dumps(timeline, ensure_ascii=False, indent=2)
             
             elif tool_name == "interview_agents":
                 # 深度采访 - 调用真实的OASIS采访API获取模拟Agent的回答（双平台）
@@ -1055,14 +1099,14 @@ class ReportAgent:
                 return json.dumps(result, ensure_ascii=False, indent=2)
             
             else:
-                return f"未知工具: {tool_name}。请使用以下工具之一: insight_forge, panorama_search, quick_search"
+                return f"未知工具: {tool_name}。请使用以下工具之一: insight_forge, panorama_search, timeline_search, quick_search"
                 
         except Exception as e:
             logger.error(t('report.toolExecFailed', toolName=tool_name, error=str(e)))
             return f"工具执行失败: {str(e)}"
     
     # 合法的工具名称集合，用于裸 JSON 兜底解析时校验
-    VALID_TOOL_NAMES = {"insight_forge", "panorama_search", "quick_search", "interview_agents"}
+    VALID_TOOL_NAMES = {"insight_forge", "panorama_search", "timeline_search", "quick_search", "interview_agents"}
 
     def _parse_tool_calls(self, response: str) -> List[Dict[str, Any]]:
         """
@@ -1288,7 +1332,7 @@ class ReportAgent:
         min_tool_calls = 3  # 最少工具调用次数
         conflict_retries = 0  # 工具调用与Final Answer同时出现的连续冲突次数
         used_tools = set()  # 记录已调用过的工具名
-        all_tools = {"insight_forge", "panorama_search", "quick_search", "interview_agents"}
+        all_tools = {"insight_forge", "panorama_search", "timeline_search", "quick_search", "interview_agents"}
 
         # 报告上下文，用于InsightForge的子问题生成
         report_context = f"章节标题: {section.title}\n模拟需求: {self.simulation_requirement}"

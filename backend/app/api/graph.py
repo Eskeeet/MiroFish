@@ -13,10 +13,12 @@ from . import graph_bp
 from ..config import Config
 from ..services.ontology_generator import OntologyGenerator
 from ..services.local_graph_builder import LocalGraphBuilderService as GraphBuilderService
+from ..services.local_tools import LocalToolsService
 from ..services.text_processor import TextProcessor
 from ..utils.file_parser import FileParser
 from ..utils.logger import get_logger
 from ..utils.locale import t, get_locale, set_locale
+from ..utils.temporal import parse_timestamp
 from ..models.task import TaskManager, TaskStatus
 from ..models.project import ProjectManager, ProjectStatus
 
@@ -30,6 +32,15 @@ def allowed_file(filename: str) -> bool:
         return False
     ext = os.path.splitext(filename)[1].lower().lstrip('.')
     return ext in Config.ALLOWED_EXTENSIONS
+
+
+def _invalid_timestamp_argument(*names: str):
+    """Return the first present query argument that is not ISO-8601."""
+    for name in names:
+        value = request.args.get(name)
+        if value and parse_timestamp(value) is None:
+            return name
+    return None
 
 
 # ============== 项目管理接口 ==============
@@ -584,9 +595,20 @@ def get_graph_data(graph_id: str):
     """
     获取图谱数据（节点和边）
     """
+    invalid_argument = _invalid_timestamp_argument('as_of', 'known_at')
+    if invalid_argument:
+        return jsonify({
+            "success": False,
+            "error": f"{invalid_argument} must be an ISO-8601 timestamp",
+        }), 400
     try:
         builder = GraphBuilderService()
-        graph_data = builder.get_graph_data(graph_id)
+        graph_data = builder.get_graph_data(
+            graph_id,
+            as_of=request.args.get('as_of'),
+            known_at=request.args.get('known_at'),
+            include_historical=request.args.get('include_historical', 'true').lower() == 'true',
+        )
         
         return jsonify({
             "success": True,
@@ -601,10 +623,117 @@ def get_graph_data(graph_id: str):
         }), 500
 
 
+@graph_bp.route('/timeline/<graph_id>', methods=['GET'])
+def get_graph_timeline(graph_id: str):
+    """获取图谱事实时间线（包含历史事实和 Episode 来源）。"""
+    invalid_argument = _invalid_timestamp_argument('start_time', 'end_time')
+    if invalid_argument:
+        return jsonify({
+            "success": False,
+            "error": f"{invalid_argument} must be an ISO-8601 timestamp",
+        }), 400
+    try:
+        tools = LocalToolsService()
+        timeline = tools.get_fact_timeline(
+            graph_id,
+            entity_uuid=request.args.get('entity_uuid'),
+            relation_type=request.args.get('relation_type'),
+            start_time=request.args.get('start_time'),
+            end_time=request.args.get('end_time'),
+            round_from=request.args.get('round_from', type=int),
+            round_to=request.args.get('round_to', type=int),
+            include_historical=request.args.get('include_historical', 'true').lower() == 'true',
+            limit=request.args.get('limit', 200, type=int),
+        )
+        return jsonify({
+            "success": True,
+            "data": {
+                "graph_id": graph_id,
+                "count": len(timeline),
+                "timeline": timeline,
+            },
+        })
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        }), 500
+
+
+@graph_bp.route('/snapshot/<graph_id>', methods=['GET'])
+def get_graph_snapshot(graph_id: str):
+    """获取某个世界时间点的图谱快照，可选指定当时系统所知的时间。"""
+    as_of = request.args.get('as_of')
+    if not as_of:
+        return jsonify({
+            "success": False,
+            "error": "as_of is required (UTC ISO-8601)",
+        }), 400
+    invalid_argument = _invalid_timestamp_argument('as_of', 'known_at')
+    if invalid_argument:
+        return jsonify({
+            "success": False,
+            "error": f"{invalid_argument} must be an ISO-8601 timestamp",
+        }), 400
+    try:
+        snapshot = LocalToolsService().get_graph_at_time(
+            graph_id,
+            as_of,
+            known_at=request.args.get('known_at'),
+            limit=request.args.get('limit', 1000, type=int),
+        )
+        return jsonify({"success": True, "data": snapshot})
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        }), 500
+
+
+@graph_bp.route('/episodes/<graph_id>', methods=['GET'])
+def get_graph_episodes(graph_id: str):
+    """获取图谱事实对应的原始 Episode 来源。"""
+    invalid_argument = _invalid_timestamp_argument('start_time', 'end_time')
+    if invalid_argument:
+        return jsonify({
+            "success": False,
+            "error": f"{invalid_argument} must be an ISO-8601 timestamp",
+        }), 400
+    try:
+        episodes = LocalToolsService().get_episodes(
+            graph_id,
+            start_time=request.args.get('start_time'),
+            end_time=request.args.get('end_time'),
+            limit=request.args.get('limit', 200, type=int),
+        )
+        return jsonify({
+            "success": True,
+            "data": {
+                "graph_id": graph_id,
+                "count": len(episodes),
+                "episodes": episodes,
+            },
+        })
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        }), 500
+
+
 @graph_bp.route('/delete/<graph_id>', methods=['DELETE'])
 def delete_graph(graph_id: str):
     """
-    删除Zep图谱
+    删除本地图谱
     """
     try:
         builder = GraphBuilderService()

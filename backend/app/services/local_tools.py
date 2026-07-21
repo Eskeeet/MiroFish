@@ -5,7 +5,6 @@
 """
 
 import json
-import time
 import re
 from typing import Any, Dict, List, Optional
 
@@ -15,6 +14,8 @@ from ..utils.llm_client import LLMClient
 from ..utils.graph_db import run_query
 from ..utils.vector_store import semantic_search
 from ..utils.embedder import embed
+from ..utils.temporal import fact_matches_temporal_filter
+from .temporal_graph import TemporalGraphService
 
 from dataclasses import dataclass, field
 
@@ -72,16 +73,21 @@ class EdgeInfo:
     source_node_name: Optional[str] = None
     target_node_name: Optional[str] = None
     created_at: Optional[str] = None
+    reference_time: Optional[str] = None
     valid_at: Optional[str] = None
     invalid_at: Optional[str] = None
     expired_at: Optional[str] = None
+    round_num: int = -1
+    episodes: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {"uuid": self.uuid, "name": self.name, "fact": self.fact,
                 "source_node_uuid": self.source_node_uuid, "target_node_uuid": self.target_node_uuid,
                 "source_node_name": self.source_node_name, "target_node_name": self.target_node_name,
                 "created_at": self.created_at, "valid_at": self.valid_at,
-                "invalid_at": self.invalid_at, "expired_at": self.expired_at}
+                "reference_time": self.reference_time,
+                "invalid_at": self.invalid_at, "expired_at": self.expired_at,
+                "round_num": self.round_num, "episodes": self.episodes}
 
     def to_text(self, include_temporal: bool = False) -> str:
         source = self.source_node_name or self.source_node_uuid[:8]
@@ -300,6 +306,13 @@ class LocalToolsService:
         query: str,
         limit: int = 10,
         scope: str = "edges",
+        as_of: Any = None,
+        known_at: Any = None,
+        start_time: Any = None,
+        end_time: Any = None,
+        round_from: Optional[int] = None,
+        round_to: Optional[int] = None,
+        include_historical: bool = False,
     ) -> SearchResult:
         """
         混合语义搜索（ChromaDB语义 60% + BM25关键词 40%）
@@ -316,8 +329,32 @@ class LocalToolsService:
             chroma_results = semantic_search(
                 query_embedding=query_emb,
                 graph_id=graph_id,
-                n_results=limit * 3,
+                n_results=limit * 8,
             )
+
+            edge_ids = [
+                item.get("metadata", {}).get("edge_uuid")
+                for item in chroma_results
+                if item.get("metadata", {}).get("doc_type", "edge_fact") == "edge_fact"
+                and item.get("metadata", {}).get("edge_uuid")
+            ]
+            edge_records = run_query(
+                """
+                MATCH (s:Entity {graph_id: $graph_id})-[r]->(t:Entity {graph_id: $graph_id})
+                WHERE r.uuid IN $edge_ids
+                RETURN properties(r) AS props, type(r) AS rel_type,
+                       s.uuid AS source_uuid, s.name AS source_name,
+                       t.uuid AS target_uuid, t.name AS target_name
+                """,
+                {"graph_id": graph_id, "edge_ids": edge_ids},
+            ) if edge_ids else []
+            edge_truth = {
+                edge["uuid"]: edge
+                for edge in (
+                    TemporalGraphService._edge_record_to_dict(record)
+                    for record in edge_records
+                )
+            }
 
             # --- BM25 关键词评分 ---
             keywords = [w.strip() for w in query.lower().replace(',', ' ').replace('，', ' ').split() if len(w.strip()) > 1]
@@ -340,25 +377,37 @@ class LocalToolsService:
                 scored.append({**item, "hybrid": hybrid})
 
             scored.sort(key=lambda x: x["hybrid"], reverse=True)
-            top = scored[:limit]
+            # Temporal filtering happens against Neo4j below, so retain the
+            # larger candidate pool until invalid/historical facts are removed.
+            top = scored[: limit * 8]
 
             seen_facts: set = set()
             for item in top:
                 meta = item["metadata"]
                 doc_type = meta.get("doc_type", "edge_fact")
                 if doc_type == "edge_fact":
-                    fact = item["document"]
+                    if scope not in ("edges", "both"):
+                        continue
+                    edge = edge_truth.get(meta.get("edge_uuid", ""))
+                    if edge is None or not fact_matches_temporal_filter(
+                        edge,
+                        as_of=as_of,
+                        known_at=known_at,
+                        start_time=start_time,
+                        end_time=end_time,
+                        round_from=round_from,
+                        round_to=round_to,
+                        include_historical=include_historical,
+                    ):
+                        continue
+                    fact = edge.get("fact") or item["document"]
                     if fact and fact not in seen_facts:
                         facts.append(fact)
                         seen_facts.add(fact)
-                    edges.append({
-                        "uuid": meta.get("edge_uuid", ""),
-                        "name": meta.get("rel_type", ""),
-                        "fact": fact,
-                        "source_node_uuid": meta.get("source_uuid", ""),
-                        "target_node_uuid": meta.get("target_uuid", ""),
-                    })
+                    edges.append(edge)
                 elif doc_type == "node_summary":
+                    if scope not in ("nodes", "both"):
+                        continue
                     node_name = meta.get("node_name", "")
                     summary = item["document"]
                     if summary:
@@ -370,9 +419,24 @@ class LocalToolsService:
                         "summary": summary,
                     })
 
+                if len(facts) >= limit:
+                    break
+
         except Exception as e:
             logger.warning(f"向量搜索失败，降级为关键词搜索: {e}")
-            return self._keyword_search(graph_id, query, limit, scope)
+            return self._keyword_search(
+                graph_id,
+                query,
+                limit,
+                scope,
+                as_of=as_of,
+                known_at=known_at,
+                start_time=start_time,
+                end_time=end_time,
+                round_from=round_from,
+                round_to=round_to,
+                include_historical=include_historical,
+            )
 
         logger.info(f"搜索完成: 找到 {len(facts)} 条相关事实")
         return SearchResult(facts=facts, edges=edges, nodes=nodes, query=query, total_count=len(facts))
@@ -383,6 +447,7 @@ class LocalToolsService:
         query: str,
         limit: int = 10,
         scope: str = "edges",
+        **temporal_filters: Any,
     ) -> SearchResult:
         """关键词匹配降级搜索"""
         query_lower = query.lower()
@@ -401,7 +466,7 @@ class LocalToolsService:
         nodes_result: List[Dict[str, Any]] = []
 
         if scope in ("edges", "both"):
-            all_edges = self.get_all_edges(graph_id)
+            all_edges = self.get_all_edges(graph_id, **temporal_filters)
             scored = sorted(
                 [(match_score(e.fact) + match_score(e.name), e) for e in all_edges if match_score(e.fact) + match_score(e.name) > 0],
                 key=lambda x: x[0], reverse=True
@@ -450,7 +515,19 @@ class LocalToolsService:
         logger.info(f"获取到 {len(result)} 个节点")
         return result
 
-    def get_all_edges(self, graph_id: str, include_temporal: bool = True) -> List[EdgeInfo]:
+    def get_all_edges(
+        self,
+        graph_id: str,
+        include_temporal: bool = True,
+        *,
+        as_of: Any = None,
+        known_at: Any = None,
+        start_time: Any = None,
+        end_time: Any = None,
+        round_from: Optional[int] = None,
+        round_to: Optional[int] = None,
+        include_historical: bool = True,
+    ) -> List[EdgeInfo]:
         """获取图谱的所有边（含时间信息）"""
         logger.info(f"获取图谱 {graph_id} 的所有边...")
         records = run_query(
@@ -476,10 +553,25 @@ class LocalToolsService:
             )
             if include_temporal:
                 ei.created_at = props.get("created_at")
+                ei.reference_time = props.get("reference_time")
                 ei.valid_at = props.get("valid_at")
                 ei.invalid_at = props.get("invalid_at")
                 ei.expired_at = props.get("expired_at")
-            result.append(ei)
+                ei.round_num = props.get("round_num", -1)
+                ei.episodes = props.get("episodes") or (
+                    [props["episode_source"]] if props.get("episode_source") else []
+                )
+            if fact_matches_temporal_filter(
+                ei.to_dict(),
+                as_of=as_of,
+                known_at=known_at,
+                start_time=start_time,
+                end_time=end_time,
+                round_from=round_from,
+                round_to=round_to,
+                include_historical=include_historical,
+            ):
+                result.append(ei)
         logger.info(f"获取到 {len(result)} 条边")
         return result
 
@@ -531,6 +623,12 @@ class LocalToolsService:
                     valid_at=props.get("valid_at"),
                     invalid_at=props.get("invalid_at"),
                     expired_at=props.get("expired_at"),
+                    created_at=props.get("created_at"),
+                    reference_time=props.get("reference_time"),
+                    round_num=props.get("round_num", -1),
+                    episodes=props.get("episodes") or (
+                        [props["episode_source"]] if props.get("episode_source") else []
+                    ),
                 ))
             return result
         except Exception as e:
@@ -575,6 +673,81 @@ class LocalToolsService:
             "entity_types": entity_types,
             "relation_types": relation_types,
         }
+
+    def get_fact_timeline(
+        self,
+        graph_id: str,
+        *,
+        entity_uuid: Optional[str] = None,
+        relation_type: Optional[str] = None,
+        start_time: Any = None,
+        end_time: Any = None,
+        round_from: Optional[int] = None,
+        round_to: Optional[int] = None,
+        include_historical: bool = True,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Return a time-ordered fact series with validity and provenance."""
+        return TemporalGraphService.get_timeline(
+            graph_id,
+            entity_uuid=entity_uuid,
+            relation_type=relation_type,
+            start_time=start_time,
+            end_time=end_time,
+            round_from=round_from,
+            round_to=round_to,
+            include_historical=include_historical,
+            limit=limit,
+        )
+
+    def get_graph_at_time(
+        self,
+        graph_id: str,
+        as_of: Any,
+        *,
+        known_at: Any = None,
+        limit: int = 1000,
+    ) -> Dict[str, Any]:
+        """Return the facts true at event time, optionally as known at system time."""
+        facts = TemporalGraphService.get_timeline(
+            graph_id,
+            as_of=as_of,
+            known_at=known_at,
+            include_historical=True,
+            limit=limit,
+        )
+        entity_ids = {
+            edge[entity_key]
+            for edge in facts
+            for entity_key in ("source_node_uuid", "target_node_uuid")
+            if edge.get(entity_key)
+        }
+        nodes = [node.to_dict() for node in self.get_all_nodes(graph_id) if node.uuid in entity_ids]
+        return {
+            "graph_id": graph_id,
+            "as_of": as_of,
+            "known_at": known_at,
+            "nodes": nodes,
+            "edges": facts,
+            "node_count": len(nodes),
+            "edge_count": len(facts),
+        }
+
+    def get_episodes(
+        self,
+        graph_id: str,
+        *,
+        start_time: Any = None,
+        end_time: Any = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """Return raw episodes that produced the graph's facts."""
+        return TemporalGraphService.list_episodes(
+            graph_id,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+        )
 
     def get_simulation_context(self, graph_id: str, simulation_requirement: str, limit: int = 30) -> Dict[str, Any]:
         """获取模拟相关的上下文信息"""
@@ -720,7 +893,6 @@ class LocalToolsService:
 
         result = PanoramaResult(query=query)
         all_nodes = self.get_all_nodes(graph_id)
-        node_map = {n.uuid: n for n in all_nodes}
         result.all_nodes = all_nodes
         result.total_nodes = len(all_nodes)
 

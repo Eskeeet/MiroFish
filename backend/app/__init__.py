@@ -42,16 +42,24 @@ def create_app(config_class=Config):
     # 启用CORS
     CORS(app, resources={r"/api/*": {"origins": "*"}})
     
-    # 预热本地嵌入模型（SentenceTransformer）并初始化Neo4j约束
+    # 先初始化 Neo4j 时态结构；嵌入模型预热失败不应阻止图谱迁移。
+    try:
+        from .utils.graph_db import ensure_constraints
+        from .services.temporal_graph import TemporalGraphService
+        ensure_constraints()
+        TemporalGraphService.migrate_legacy_temporal_data()
+        if should_log_startup:
+            logger.info("Neo4j约束与时态图谱初始化完成")
+    except Exception as e:
+        logger.warning(f"Neo4j时态图谱初始化失败（可在首次使用时重试）: {e}")
+
     try:
         from .utils.embedder import warmup as embedder_warmup
-        from .utils.graph_db import ensure_constraints
         embedder_warmup()
-        ensure_constraints()
         if should_log_startup:
-            logger.info("本地嵌入模型与Neo4j约束初始化完成")
+            logger.info("本地嵌入模型初始化完成")
     except Exception as e:
-        logger.warning(f"本地后端初始化失败（可在首次使用时重试）: {e}")
+        logger.warning(f"本地嵌入模型初始化失败（可在首次使用时重试）: {e}")
 
     # 注册模拟进程清理函数（确保服务器关闭时终止所有模拟进程）
     from .services.simulation_runner import SimulationRunner
@@ -88,4 +96,3 @@ def create_app(config_class=Config):
         logger.info("MiroFish Backend 启动完成")
     
     return app
-

@@ -8,7 +8,8 @@ from typing import Dict, Any, List, Optional, Set
 
 from ..utils.logger import get_logger
 from ..utils.graph_db import run_query
-from .zep_entity_reader import EntityNode, FilteredEntities
+from ..utils.temporal import fact_matches_temporal_filter
+from .graph_models import EntityNode, FilteredEntities
 
 logger = get_logger('mirofish.local_entity_reader')
 
@@ -50,7 +51,14 @@ class LocalEntityReader:
         logger.info(f"共获取 {len(nodes_data)} 个节点")
         return nodes_data
 
-    def get_all_edges(self, graph_id: str) -> List[Dict[str, Any]]:
+    def get_all_edges(
+        self,
+        graph_id: str,
+        *,
+        include_historical: bool = False,
+        as_of: Any = None,
+        known_at: Any = None,
+    ) -> List[Dict[str, Any]]:
         """获取图谱的所有边"""
         logger.info(f"获取图谱 {graph_id} 的所有边...")
 
@@ -66,7 +74,7 @@ class LocalEntityReader:
         edges_data = []
         for record in records:
             props = record["props"]
-            edges_data.append({
+            edge_data = {
                 "uuid": props.get("uuid", ""),
                 "name": props.get("name", record["rel_type"]),
                 "fact": props.get("fact", ""),
@@ -76,12 +84,32 @@ class LocalEntityReader:
                 "valid_at": props.get("valid_at"),
                 "invalid_at": props.get("invalid_at"),
                 "expired_at": props.get("expired_at"),
-            })
+                "created_at": props.get("created_at"),
+                "reference_time": props.get("reference_time"),
+                "round_num": props.get("round_num", -1),
+                "episodes": props.get("episodes") or (
+                    [props["episode_source"]] if props.get("episode_source") else []
+                ),
+            }
+            if fact_matches_temporal_filter(
+                edge_data,
+                as_of=as_of,
+                known_at=known_at,
+                include_historical=include_historical,
+            ):
+                edges_data.append(edge_data)
 
         logger.info(f"共获取 {len(edges_data)} 条边")
         return edges_data
 
-    def get_node_edges(self, node_uuid: str) -> List[Dict[str, Any]]:
+    def get_node_edges(
+        self,
+        node_uuid: str,
+        *,
+        include_historical: bool = False,
+        as_of: Any = None,
+        known_at: Any = None,
+    ) -> List[Dict[str, Any]]:
         """获取指定节点的所有相关边"""
         try:
             records = run_query(
@@ -97,14 +125,30 @@ class LocalEntityReader:
             edges_data = []
             for record in records:
                 props = record["props"]
-                edges_data.append({
+                edge_data = {
                     "uuid": props.get("uuid", ""),
                     "name": props.get("name", record["rel_type"]),
                     "fact": props.get("fact", ""),
                     "source_node_uuid": record["start_uuid"],
                     "target_node_uuid": record["end_uuid"],
                     "attributes": {},
-                })
+                    "valid_at": props.get("valid_at"),
+                    "invalid_at": props.get("invalid_at"),
+                    "expired_at": props.get("expired_at"),
+                    "created_at": props.get("created_at"),
+                    "reference_time": props.get("reference_time"),
+                    "round_num": props.get("round_num", -1),
+                    "episodes": props.get("episodes") or (
+                        [props["episode_source"]] if props.get("episode_source") else []
+                    ),
+                }
+                if fact_matches_temporal_filter(
+                    edge_data,
+                    as_of=as_of,
+                    known_at=known_at,
+                    include_historical=include_historical,
+                ):
+                    edges_data.append(edge_data)
             return edges_data
         except Exception as e:
             logger.warning(f"获取节点 {node_uuid} 的边失败: {str(e)}")

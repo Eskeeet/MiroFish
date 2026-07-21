@@ -6,20 +6,21 @@
 import os
 import uuid
 import json
-import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from ..config import Config
 from ..models.task import TaskManager, TaskStatus
-from ..utils.graph_db import run_query, run_write, create_relationship, ensure_constraints, validate_rel_type
+from ..utils.graph_db import run_query, run_write, ensure_constraints, validate_rel_type
 from ..utils.vector_store import upsert_facts, delete_graph_facts
 from ..utils.embedder import embed_batch
 from ..utils.llm_client import LLMClient
 from ..utils.logger import get_logger
+from ..utils.temporal import fact_matches_temporal_filter, utc_now_iso
 from .text_processor import TextProcessor
+from .temporal_graph import TemporalGraphService
+from .graph_models import GraphInfo
 
 logger = get_logger('mirofish.local_graph_builder')
 
@@ -73,14 +74,26 @@ class EntityExtractor:
     {"name": "实体名称", "type": "实体类型", "attributes": {}, "summary": "一句话描述"}
   ],
   "relationships": [
-    {"source": "源实体名称", "target": "目标实体名称", "type": "关系类型", "fact": "完整的事实陈述句"}
+    {"source": "源实体名称", "target": "目标实体名称", "type": "关系类型", "fact": "完整的事实陈述句", "valid_at": "ISO-8601或null", "invalid_at": "ISO-8601或null"}
   ]
-}"""
+}
+
+时间规则：
+- valid_at 是事实开始成立的世界时间，invalid_at 是停止成立的世界时间
+- 使用参考时间解析“昨天”、“上周”等相对时间
+- 当前持续成立的事实使用参考时间作为 valid_at
+- 只有明确结束/变更时才设置 invalid_at；不得编造日期
+- 时间统一使用 UTC ISO-8601"""
 
     def __init__(self, llm_client: Optional[LLMClient] = None):
         self._llm = llm_client or LLMClient()
 
-    def extract(self, text: str, ontology: Dict[str, Any]) -> Dict[str, Any]:
+    def extract(
+        self,
+        text: str,
+        ontology: Dict[str, Any],
+        reference_time: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """从文本中提取实体和关系"""
         entity_types = [e["name"] for e in ontology.get("entity_types", [])]
         edge_types = [e["name"] for e in ontology.get("edge_types", [])]
@@ -88,6 +101,8 @@ class EntityExtractor:
         prompt = f"""本体定义：
 实体类型: {json.dumps(entity_types, ensure_ascii=False)}
 关系类型: {json.dumps(edge_types, ensure_ascii=False)}
+
+参考时间（UTC ISO-8601）：{reference_time or utc_now_iso()}
 
 待处理文本：
 {text}
@@ -215,7 +230,7 @@ class LocalGraphBuilderService:
 
             # 5. 分批提取并写入
             all_facts: List[str] = []
-            batch_ids = self.add_text_batches(
+            self.add_text_batches(
                 graph_id,
                 chunks,
                 ontology,
@@ -309,15 +324,27 @@ class LocalGraphBuilderService:
 
         def _extract_batch(batch_num, batch_chunks):
             combined = "\n\n---\n\n".join(batch_chunks)
-            return batch_num, self._extractor.extract(combined, ontology)
+            reference_time = utc_now_iso()
+            return (
+                batch_num,
+                combined,
+                reference_time,
+                self._extractor.extract(combined, ontology, reference_time=reference_time),
+            )
 
-        def _write_batch(batch_num, extracted):
+        def _write_batch(batch_num, combined, reference_time, extracted):
             nonlocal total_nodes_created, total_edges_created, completed_count
-            batch_id = f"batch_{graph_id}_{batch_num}"
-            facts_to_embed = []
+            batch_id = TemporalGraphService.create_episode(
+                graph_id,
+                combined,
+                reference_time=reference_time,
+                source="text",
+                source_description="document chunk batch",
+                name=f"batch_{batch_num}",
+                metadata={"batch_number": batch_num},
+            )
             entities = extracted.get("entities", [])
             relationships = extracted.get("relationships", [])
-            chunk_entity_map = {}
 
             for ent in entities:
                 if not isinstance(ent, dict):
@@ -351,61 +378,19 @@ class LocalGraphBuilderService:
                     "attributes": attrs_json,
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 })
-                chunk_entity_map[ent_name] = ent_uuid
 
-            for rel in relationships:
-                if not isinstance(rel, dict):
-                    continue
-                src_name = (rel.get("source") or "").strip()
-                tgt_name = (rel.get("target") or "").strip()
-                rel_type = (rel.get("type") or "").strip()
-                fact = (rel.get("fact") or "").strip()
-                if not src_name or not tgt_name or not fact:
-                    continue
-                if rel_type not in valid_edge_types:
-                    continue
-                src_uuid = chunk_entity_map.get(src_name) or existing_names.get(src_name.lower())
-                tgt_uuid = chunk_entity_map.get(tgt_name) or existing_names.get(tgt_name.lower())
-                if not src_uuid or not tgt_uuid:
-                    continue
-                rel_uuid = uuid.uuid4().hex
-                now = datetime.now(timezone.utc).isoformat()
-                create_relationship(src_uuid, tgt_uuid, validate_rel_type(rel_type), {
-                    "uuid": rel_uuid,
-                    "graph_id": graph_id,
-                    "name": rel_type,
-                    "fact": fact,
-                    "valid_at": now,
-                    "invalid_at": None,
-                    "expired_at": None,
-                    "round_num": -1,
-                    "episode_source": batch_id,
-                })
-                total_edges_created += 1
-                facts_to_embed.append({
-                    "id": rel_uuid,
-                    "text": fact,
-                    "metadata": {
-                        "graph_id": graph_id,
-                        "edge_uuid": rel_uuid,
-                        "source_name": src_name,
-                        "target_name": tgt_name,
-                        "rel_type": rel_type,
-                        "valid_at": now,
-                        "invalid_at": "",
-                        "round_num": -1,
-                        "doc_type": "edge_fact",
-                    },
-                })
-                if collected_facts is not None:
-                    collected_facts.append(fact)
-
-            if facts_to_embed:
-                texts = [f["text"] for f in facts_to_embed]
-                embeddings = embed_batch(texts)
-                for item, emb in zip(facts_to_embed, embeddings):
-                    item["embedding"] = emb
-                upsert_facts(facts_to_embed)
+            temporal_result = TemporalGraphService.ingest_relationships(
+                graph_id,
+                relationships,
+                episode_uuid=batch_id,
+                reference_time=reference_time,
+                round_num=-1,
+                valid_edge_types=valid_edge_types,
+                llm=self._extractor._llm,
+            )
+            total_edges_created += temporal_result.created_count
+            if collected_facts is not None:
+                collected_facts.extend(temporal_result.facts)
 
             batch_ids.append(batch_id)
             completed_count += 1
@@ -419,12 +404,12 @@ class LocalGraphBuilderService:
             futures = {pool.submit(_extract_batch, bn, bc): bn for bn, bc in batch_list}
             for fut in as_completed(futures):
                 try:
-                    batch_num, extracted = fut.result()
+                    batch_num, combined, reference_time, extracted = fut.result()
                 except Exception as e:
                     logger.warning(f"批次 {futures[fut]} 提取异常: {e}")
                     continue
                 with write_lock:
-                    _write_batch(batch_num, extracted)
+                    _write_batch(batch_num, combined, reference_time, extracted)
 
         meta = _load_meta(graph_id) or {}
         meta["node_count"] = meta.get("node_count", 0) + total_nodes_created
@@ -455,8 +440,27 @@ class LocalGraphBuilderService:
                     {"uuid": ent["uuid"], "summary": summary},
                 )
 
+        summaries_to_embed = [
+            {
+                "id": f"node_{ent['uuid']}",
+                "text": summaries[ent["name"]],
+                "metadata": {
+                    "graph_id": graph_id,
+                    "node_uuid": ent["uuid"],
+                    "node_name": ent["name"],
+                    "doc_type": "node_summary",
+                },
+            }
+            for ent in entities
+            if summaries.get(ent["name"])
+        ]
+        if summaries_to_embed:
+            embeddings = embed_batch([item["text"] for item in summaries_to_embed])
+            for item, embedding in zip(summaries_to_embed, embeddings):
+                item["embedding"] = embedding
+            upsert_facts(summaries_to_embed)
+
     def _get_graph_info(self, graph_id: str) -> "GraphInfo":
-        from .graph_builder import GraphInfo
         node_count = run_query(
             "MATCH (n:Entity {graph_id: $g}) RETURN count(n) AS cnt",
             {"g": graph_id},
@@ -488,7 +492,14 @@ class LocalGraphBuilderService:
             entity_types=list(entity_types),
         )
 
-    def get_graph_data(self, graph_id: str) -> Dict[str, Any]:
+    def get_graph_data(
+        self,
+        graph_id: str,
+        *,
+        as_of: Any = None,
+        known_at: Any = None,
+        include_historical: bool = True,
+    ) -> Dict[str, Any]:
         """获取完整图谱数据（供前端可视化）"""
         node_records = run_query(
             "MATCH (n:Entity {graph_id: $g}) "
@@ -524,7 +535,7 @@ class LocalGraphBuilderService:
         edges_data = []
         for rec in edge_records:
             props = rec["props"]
-            edges_data.append({
+            edge_data = {
                 "uuid": props.get("uuid", ""),
                 "name": props.get("name", rec["rel_type"]),
                 "fact": props.get("fact", ""),
@@ -535,11 +546,22 @@ class LocalGraphBuilderService:
                 "target_node_name": node_map.get(rec["target_uuid"], ""),
                 "attributes": {},
                 "created_at": props.get("created_at"),
+                "reference_time": props.get("reference_time"),
                 "valid_at": props.get("valid_at"),
                 "invalid_at": props.get("invalid_at"),
                 "expired_at": props.get("expired_at"),
-                "episodes": [],
-            })
+                "round_num": props.get("round_num", -1),
+                "episodes": props.get("episodes") or (
+                    [props["episode_source"]] if props.get("episode_source") else []
+                ),
+            }
+            if fact_matches_temporal_filter(
+                edge_data,
+                as_of=as_of,
+                known_at=known_at,
+                include_historical=include_historical,
+            ):
+                edges_data.append(edge_data)
 
         return {
             "graph_id": graph_id,
@@ -553,6 +575,10 @@ class LocalGraphBuilderService:
         """删除图谱（Neo4j + ChromaDB + 元数据文件）"""
         run_write(
             "MATCH (n:Entity {graph_id: $g}) DETACH DELETE n",
+            {"g": graph_id},
+        )
+        run_write(
+            "MATCH (ep:Episode {graph_id: $g}) DETACH DELETE ep",
             {"g": graph_id},
         )
         delete_graph_facts(graph_id)

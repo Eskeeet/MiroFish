@@ -9,23 +9,19 @@
 - 唯一变化：_send_batch_activities() 写入本地 Neo4j 而非 Zep
 """
 
-import uuid
 import time
 import threading
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 from queue import Queue, Empty
 
-from ..config import Config
-from ..utils.graph_db import run_query, run_write, create_relationship, validate_rel_type, ensure_constraints
-from ..utils.vector_store import upsert_facts
-from ..utils.embedder import embed_batch
 from ..utils.llm_client import LLMClient
 from ..utils.logger import get_logger
+from ..utils.temporal import latest_timestamp, to_iso, utc_now_iso
+from .temporal_graph import TemporalGraphService
 
-# 直接复用 AgentActivity 及其所有 to_episode_text 方法
-from .zep_graph_memory_updater import AgentActivity
+from .agent_activity import AgentActivity
 
 logger = get_logger('mirofish.local_graph_memory_updater')
 
@@ -41,9 +37,17 @@ _EPISODE_SYSTEM_PROMPT = """你是一个知识图谱更新助手。
 以 JSON 输出：
 {
   "relationships": [
-    {"source": "实体A", "target": "实体B", "type": "关系类型", "fact": "完整事实句"}
+    {"source": "实体A", "target": "实体B", "type": "关系类型", "fact": "完整事实句", "valid_at": "ISO-8601或null", "invalid_at": "ISO-8601或null", "round_num": 轮次整数}
   ]
 }
+
+时间规则：
+- valid_at 是事实开始成立的世界时间，invalid_at 是停止成立的世界时间
+- 使用活动参考时间解析“上一轮”、“昨天”等相对时间
+- 每条活动前已有精确时间和轮次；事实应复制其来源活动的时间与轮次
+- 同一事实跨多条活动时，使用首次明确成立的时间和最新相关活动的轮次
+- 当前持续成立的事实设 valid_at 为参考时间
+- 仅在活动明确表示结束/变更时设置 invalid_at，不得编造时间
 
 如果没有有意义的新关系，输出 {"relationships": []}"""
 
@@ -53,14 +57,21 @@ def _extract_episode_facts(
     graph_id: str,
     valid_edge_types: List[str],
     llm: LLMClient,
+    reference_time: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """从 episode 文本中提取关系事实（LLM调用）"""
     edge_types_str = json.dumps(valid_edge_types, ensure_ascii=False)
-    prompt = f"可用关系类型: {edge_types_str}\n\nAgent活动记录：\n{episode_text}"
+    prompt = (
+        f"可用关系类型: {edge_types_str}\n"
+        f"参考时间（UTC ISO-8601）: {reference_time or utc_now_iso()}\n\n"
+        f"Agent活动记录：\n{episode_text}"
+    )
     try:
         result = llm.chat_json(
-            system_prompt=_EPISODE_SYSTEM_PROMPT,
-            user_message=prompt,
+            messages=[
+                {"role": "system", "content": _EPISODE_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
             temperature=0.1,
         )
         if isinstance(result, dict):
@@ -198,43 +209,59 @@ class LocalGraphMemoryUpdater:
         if not activities:
             return
 
-        episode_texts = [a.to_episode_text() for a in activities]
+        episode_texts = [
+            f"[{to_iso(activity.timestamp, fallback=utc_now_iso())}] "
+            f"[轮次 {activity.round_num}] {activity.to_episode_text()}"
+            for activity in activities
+        ]
         combined_text = "\n".join(episode_texts)
         round_num = max(a.round_num for a in activities)
-        now = datetime.now(timezone.utc).isoformat()
-        episode_uuid = uuid.uuid4().hex
+        round_from = min(a.round_num for a in activities)
+        now = utc_now_iso()
+        reference_time = latest_timestamp(
+            (activity.timestamp for activity in activities),
+            fallback=now,
+        )
 
         # --- 1. 存储 Episode 节点（轻量，不依赖 LLM）---
         try:
-            run_write(
-                """
-                MERGE (ep:Episode {uuid: $uuid})
-                SET ep.graph_id = $graph_id,
-                    ep.text = $text,
-                    ep.platform = $platform,
-                    ep.round_num = $round_num,
-                    ep.created_at = $created_at
-                """,
-                {
-                    "uuid": episode_uuid,
-                    "graph_id": self.graph_id,
-                    "text": combined_text[:2000],
-                    "platform": platform,
-                    "round_num": round_num,
-                    "created_at": now,
+            episode_uuid = TemporalGraphService.create_episode(
+                self.graph_id,
+                combined_text,
+                reference_time=reference_time,
+                source="message",
+                source_description="OASIS simulation activity batch",
+                name=f"{platform}_round_{round_num}",
+                round_num=round_num,
+                platform=platform,
+                metadata={
+                    "activity_count": len(activities),
+                    "agent_ids": list(dict.fromkeys(a.agent_id for a in activities)),
+                    "round_from": round_from,
+                    "round_to": round_num,
                 },
             )
         except Exception as e:
             logger.warning(f"存储 Episode 节点失败: {e}")
+            self._failed_count += 1
+            return
 
         # --- 2. LLM 提取关系 ---
         for attempt in range(self.MAX_RETRIES):
             try:
                 relationships = _extract_episode_facts(
-                    combined_text, self.graph_id, self._valid_edge_types, self._llm
+                    combined_text,
+                    self.graph_id,
+                    self._valid_edge_types,
+                    self._llm,
+                    reference_time=reference_time,
                 )
-                if relationships:
-                    self._write_relationships(relationships, round_num, episode_uuid, now)
+                self._write_relationships(
+                    relationships,
+                    round_num,
+                    episode_uuid,
+                    reference_time or now,
+                )
 
                 self._total_sent += 1
                 self._total_items_sent += len(activities)
@@ -255,90 +282,18 @@ class LocalGraphMemoryUpdater:
         relationships: List[Dict[str, Any]],
         round_num: int,
         episode_uuid: str,
-        now: str,
+        reference_time: str,
     ):
-        """将提取的关系写入 Neo4j + ChromaDB，处理时态冲突"""
-        # 加载现有节点（名称索引）
-        existing = run_query(
-            "MATCH (n:Entity {graph_id: $g}) RETURN n.uuid AS uuid, n.name AS name",
-            {"g": self.graph_id},
+        """将提取的关系写入双时态图谱，并保留 Episode 来源。"""
+        return TemporalGraphService.ingest_relationships(
+            self.graph_id,
+            relationships,
+            episode_uuid=episode_uuid,
+            reference_time=reference_time,
+            round_num=round_num,
+            valid_edge_types=set(self._valid_edge_types),
+            llm=self._llm,
         )
-        name_to_uuid = {r["name"].lower(): r["uuid"] for r in existing if r["name"]}
-
-        facts_to_embed: List[Dict[str, Any]] = []
-
-        for rel in relationships:
-            src_name = (rel.get("source") or "").strip()
-            tgt_name = (rel.get("target") or "").strip()
-            rel_type = (rel.get("type") or "RELATED_TO").strip()
-            fact = (rel.get("fact") or "").strip()
-
-            if not src_name or not tgt_name or not fact:
-                continue
-
-            src_uuid = name_to_uuid.get(src_name.lower())
-            tgt_uuid = name_to_uuid.get(tgt_name.lower())
-            if not src_uuid or not tgt_uuid:
-                continue
-
-            safe_type = validate_rel_type(rel_type)
-
-            # 检查是否存在活跃的相同关系（时态冲突检测）
-            active = run_query(
-                f"""
-                MATCH (s:Entity {{uuid: $s}})-[r:{safe_type}]->(t:Entity {{uuid: $t}})
-                WHERE r.invalid_at IS NULL AND r.graph_id = $g
-                RETURN r.uuid AS uuid, r.fact AS fact
-                """,
-                {"s": src_uuid, "t": tgt_uuid, "g": self.graph_id},
-            )
-            for old_rel in active:
-                if old_rel["fact"] != fact:
-                    # 失效旧关系
-                    run_write(
-                        f"""
-                        MATCH (s:Entity {{uuid: $s}})-[r:{safe_type} {{uuid: $uuid}}]->(t:Entity {{uuid: $t}})
-                        SET r.invalid_at = $now
-                        """,
-                        {"s": src_uuid, "t": tgt_uuid, "uuid": old_rel["uuid"], "now": now},
-                    )
-
-            # 写入新关系
-            rel_uuid = uuid.uuid4().hex
-            create_relationship(src_uuid, tgt_uuid, safe_type, {
-                "uuid": rel_uuid,
-                "graph_id": self.graph_id,
-                "name": rel_type,
-                "fact": fact,
-                "valid_at": now,
-                "invalid_at": None,
-                "expired_at": None,
-                "round_num": round_num,
-                "episode_source": episode_uuid,
-            })
-
-            facts_to_embed.append({
-                "id": rel_uuid,
-                "text": fact,
-                "metadata": {
-                    "graph_id": self.graph_id,
-                    "edge_uuid": rel_uuid,
-                    "source_name": src_name,
-                    "target_name": tgt_name,
-                    "rel_type": rel_type,
-                    "valid_at": now,
-                    "invalid_at": "",
-                    "round_num": round_num,
-                    "doc_type": "edge_fact",
-                },
-            })
-
-        if facts_to_embed:
-            texts = [f["text"] for f in facts_to_embed]
-            embeddings = embed_batch(texts)
-            for item, emb in zip(facts_to_embed, embeddings):
-                item["embedding"] = emb
-            upsert_facts(facts_to_embed)
 
     def _flush_remaining(self):
         while not self._activity_queue.empty():
