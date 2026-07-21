@@ -91,6 +91,30 @@ Click the image to watch MiroFish's deep prediction of the lost ending based on 
 4. **Report Generation**: ReportAgent with rich toolset for deep interaction with post-simulation environment
 5. **Deep Interaction**: Chat with any agent in the simulated world & Interact with ReportAgent
 
+### Local temporal graph
+
+This fork no longer requires the Zep SDK or a Zep API key. Neo4j stores entities,
+facts, raw source episodes, and bi-temporal history; ChromaDB provides semantic
+retrieval. Each fact distinguishes:
+
+- `valid_at` / `invalid_at`: when the fact is true in the simulated world
+- `created_at` / `expired_at`: when MiroFish learned or superseded the fact
+- `round_num` and `episodes`: the simulation round and raw-source provenance
+
+Semantic duplicate facts reuse an edge and retain every source episode.
+Contradictory facts close the appropriate event-time interval without deleting
+history, including out-of-order/backfilled events. ReportAgent can query these
+changes with its `timeline_search` tool.
+
+Temporal graph endpoints:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/graph/timeline/<graph_id>` | Fact series filtered by time, entity, relation, or round |
+| `GET /api/graph/snapshot/<graph_id>?as_of=<ISO-8601>` | Graph state at an event time; optional `known_at` transaction time |
+| `GET /api/graph/episodes/<graph_id>` | Raw source episodes and their derived edge IDs |
+| `GET /api/graph/data/<graph_id>?as_of=<ISO-8601>` | Existing graph response with optional temporal filtering |
+
 ## 🚀 Quick Start
 
 ### Option 1: Source Code Deployment (Recommended)

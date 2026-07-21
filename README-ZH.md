@@ -91,6 +91,28 @@ MiroFish 致力于打造映射现实的群体智能镜像，通过捕捉个体�
 4. **报告生成**：ReportAgent拥有丰富的工具集与模拟后环境进行深度交互
 5. **深度互动**：与模拟世界中的任意一位进行对话 & 与ReportAgent进行对话
 
+### 本地双时态图谱
+
+本分支不再需要 Zep SDK 或 Zep API Key。Neo4j 负责存储实体、事实、原始
+Episode 与双时态历史，ChromaDB 负责语义检索。每条事实会区分：
+
+- `valid_at` / `invalid_at`：事实在模拟世界中成立与失效的时间
+- `created_at` / `expired_at`：MiroFish 获知事实与被新知识取代的时间
+- `round_num` 与 `episodes`：事实所属模拟轮次及原始来源
+
+语义重复事实会复用原关系并累计全部 Episode 来源；矛盾事实会关闭正确的
+事件时间区间而不删除历史，并支持乱序补录。ReportAgent 可通过
+`timeline_search` 工具直接分析这些变化。
+
+时态图谱接口：
+
+| 接口 | 用途 |
+|---|---|
+| `GET /api/graph/timeline/<graph_id>` | 按时间、实体、关系类型或轮次筛选事实序列 |
+| `GET /api/graph/snapshot/<graph_id>?as_of=<ISO-8601>` | 查询事件时间快照，可附加 `known_at` 系统时间 |
+| `GET /api/graph/episodes/<graph_id>` | 查询原始 Episode 及其派生事实 ID |
+| `GET /api/graph/data/<graph_id>?as_of=<ISO-8601>` | 在原图谱响应上应用可选的时态过滤 |
+
 ## 🚀 快速开始
 
 ### 一、源码部署（推荐）

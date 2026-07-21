@@ -1,200 +1,120 @@
-# Replacing Zep with a Custom Local Knowledge Graph
+# Local Graph Architecture (Zep Replacement)
 
-## Overview
+## Status
 
-Replace Zep Cloud with a fully local stack: **Neo4j** (graph DB) + **ChromaDB** (vector store) + **sentence-transformers** (embeddings) + **LLM-driven entity extraction**. All five Zep roles are replaced while preserving the existing public interfaces via aliases, so callers in `api/` require zero changes.
+The runtime Zep dependency has been removed. MiroFish now uses:
 
----
+- **Neo4j** for entities, relationships, raw episodes, and temporal history
+- **ChromaDB** for fact and entity-summary vector retrieval
+- **Sentence Transformers** for multilingual local embeddings
+- The configured **OpenAI-compatible LLM** for extraction, semantic
+  deduplication, and contradiction classification
 
-## Technology Stack
+Legacy module and class names remain as dependency-free compatibility shims so
+older callers do not break. They resolve to local implementations and do not
+import `zep-cloud`.
 
-| Component | Tool | Why |
-|---|---|---|
-| Graph DB | Neo4j Community (Docker) | `neo4j` driver already in venv; Cypher handles temporal properties; ACID transactions |
-| Vector store | ChromaDB (embedded) | No server needed; stores fact metadata alongside embeddings |
-| Embeddings | `paraphrase-multilingual-MiniLM-L12-v2` | Already installed via `sentence-transformers`; handles Chinese + English; CPU-only |
-| Entity extraction | Existing LLM API | Called explicitly with ontology as context — replaces Zep's opaque server-side extraction |
+## Responsibility mapping
 
-**New deps:** `chromadb`, `rank-bm25`
-**Remove:** `zep-cloud`
-
----
-
-## Zep Role → Replacement Mapping
-
-### 1. Graph Building (`graph_builder.py` → `local_graph_builder.py`)
-
-Zep received chunked text + ontology and auto-extracted entities/relationships server-side.
-
-**New pipeline:**
-- Chunk text (same 500-char / 50-overlap, no change)
-- Per batch of 3 chunks, call LLM with structured prompt including ontology schema:
-  ```json
-  {
-    "entities": [{"name": "...", "type": "...", "attributes": {}, "summary": "..."}],
-    "relationships": [{"source": "...", "target": "...", "type": "...", "fact": "...", "confidence": "explicit|inferred"}]
-  }
-  ```
-- Filter out `confidence: "inferred"` relationships
-- Deduplicate entities: MERGE by name in Neo4j (case-insensitive); if cosine similarity > 0.85 with existing node name, treat as same entity
-- Write nodes/edges to Neo4j, embed fact text → upsert to ChromaDB
-- After all chunks, one final LLM pass to generate `node.summary` per entity
-
-### 2. Entity Reading (`zep_entity_reader.py` → `local_entity_reader.py`)
-
-**New implementation:** Pure Cypher queries.
-```cypher
-MATCH (n:Entity:<Type> {graph_id: $g})
-OPTIONAL MATCH (n)-[r]->(m)
-RETURN n, collect(r), collect(m)
-```
-Same output dataclasses (`EntityNode`, `FilteredEntities`) — no callers change.
-
-### 3. Graph Memory During Simulation (`zep_graph_memory_updater.py` → `local_graph_memory_updater.py`)
-
-Queue/thread/batch architecture is **identical**. Only `_send_batch_activities()` changes:
-- **Lazy extraction (recommended):** Store raw `Episode` nodes in Neo4j immediately (durable), run LLM extraction at end-of-round boundaries → fewer LLM calls
-- Temporal conflict: if a new fact contradicts an active relationship, `SET r.invalid_at = now` and create a new relationship
-
-### 4. Search Tools (`zep_tools.py` → `local_tools.py`)
-
-| Tool | New Implementation |
+| Former responsibility | Local implementation |
 |---|---|
-| `InsightForge` | LLM decomposes query → parallel ChromaDB sub-queries → 2-hop Neo4j traversal for top entities |
-| `PanoramaSearch` | `MATCH (n {graph_id}) RETURN n` + edges split by `invalid_at IS NULL` (active) vs not (historical) |
-| `Interview` | Already uses OASIS runner — only entity reader alias needed |
-| `quick_search` | Direct ChromaDB `.query()` with cosine similarity |
-| Base `search_graph` | ChromaDB semantic (60%) + BM25 (40%) hybrid, filtered by `graph_id` metadata |
+| Graph construction | `services/local_graph_builder.py` |
+| Entity reading | `services/local_entity_reader.py` |
+| Simulation memory updates | `services/local_graph_memory_updater.py` |
+| Retrieval/report tools | `services/local_tools.py` |
+| Episode, dedupe, contradiction, and time logic | `services/temporal_graph.py` |
+| Timestamp and interval primitives | `utils/temporal.py` |
+| Graph persistence | `utils/graph_db.py` |
+| Vector persistence | `utils/vector_store.py` |
 
-### 5. Temporal Tracking
+## Temporal model
 
-Explicit Neo4j relationship properties — written by your code, not inferred by Zep:
-```
-valid_at:    datetime when fact was created
-invalid_at:  set explicitly when a conflicting fact is extracted
-expired_at:  manually retired facts
-round_num:   which simulation round produced this fact
-```
+Facts are bi-temporal:
 
----
-
-## Data Models
-
-### Neo4j Node Schema
-```
-(:Entity:<EntityType> {
-    uuid:        STRING,   // primary key
-    graph_id:    STRING,   // project scope
-    name:        STRING,
-    summary:     STRING,   // LLM-generated, updated over time
-    attributes:  STRING,   // JSON-encoded dict
-    created_at:  DATETIME,
-    updated_at:  DATETIME
-})
-```
-
-### Neo4j Relationship Schema
-```
--[:RELATIONSHIP_TYPE {
-    uuid:           STRING,
-    graph_id:       STRING,
-    fact:           STRING,   // human-readable: "Alice works at MIT"
-    name:           STRING,
-    attributes:     STRING,   // JSON-encoded dict
-    created_at:     DATETIME,
-    valid_at:       DATETIME,
-    invalid_at:     DATETIME, // null = still valid
-    expired_at:     DATETIME,
-    round_num:      INTEGER,  // simulation round, -1 for static graph
-    episode_source: STRING
-}]->
-```
-
-### ChromaDB Document Schema
-One collection per graph (`graph_{graph_id}`), or single collection with `graph_id` metadata filter (preferred for scale):
-```json
-{
-    "id": "<edge_uuid>",
-    "document": "<fact text>",
-    "metadata": {
-        "graph_id":    "...",
-        "edge_uuid":   "...",
-        "source_name": "Alice",
-        "target_name": "MIT",
-        "rel_type":    "WORKS_FOR",
-        "valid_at":    "2026-03-14T10:00:00",
-        "invalid_at":  "",
-        "round_num":   -1,
-        "doc_type":    "edge_fact"
-    }
-}
-```
-Node summaries are also indexed with `doc_type: "node_summary"`.
-
-### Graph Metadata File
-Stored at `backend/uploads/projects/<project_id>/graph_metadata.json`:
-```json
-{
-    "graph_id":    "mirofish_xxx",
-    "name":        "...",
-    "ontology":    {},
-    "graph_backend": "local",
-    "created_at":  "...",
-    "node_count":  0,
-    "edge_count":  0,
-    "entity_types": []
-}
-```
-
----
-
-## Files to Create
-
-| File | Role |
+| Property | Meaning |
 |---|---|
-| `backend/app/utils/graph_db.py` | Neo4j driver singleton + `run_query(cypher, params)` |
-| `backend/app/utils/vector_store.py` | ChromaDB persistent client, `upsert_facts()`, `semantic_search()` |
-| `backend/app/utils/embedder.py` | SentenceTransformer singleton (warm at startup), `embed(text)` |
-| `backend/app/services/local_graph_builder.py` | LLM NER + Neo4j writes + ChromaDB upserts |
-| `backend/app/services/local_entity_reader.py` | Cypher-based reader, same public interface as `ZepEntityReader` |
-| `backend/app/services/local_graph_memory_updater.py` | Same queue architecture, local backend |
-| `backend/app/services/local_tools.py` | ChromaDB + Neo4j search tools |
+| `valid_at` | Event time when the fact began to be true |
+| `invalid_at` | Event time when it stopped being true |
+| `created_at` | Transaction time when MiroFish learned it |
+| `expired_at` | Transaction time when the graph learned it was no longer current or it was superseded |
+| `reference_time` | Source episode time used to resolve relative dates |
+| `round_num` | Simulation round that produced this particular fact |
+| `episodes` | IDs of all raw episodes supporting the fact |
 
----
+Intervals are half-open: `[valid_at, invalid_at)`. Matching Graphiti, a fact
+extracted with an explicit event-time end is retained as history and marked
+inactive in the transaction-time view at ingestion.
 
-## Files to Modify
+### Ingestion rules
 
-| File | Change |
+1. Store the raw input as an `Episode` before extraction.
+2. Extract `valid_at`, `invalid_at`, and `round_num` with each relationship.
+3. Reuse exact or semantic duplicates only when their intervals overlap, then
+   append the new episode ID.
+4. Use the LLM to identify semantic contradictions among relevant facts.
+5. If a newer event contradicts an older one, close the older fact at the new
+   fact's `valid_at` and set its transaction `expired_at`.
+6. If an older event arrives out of order, retain it as backfilled history and
+   close it at the already-known newer fact's `valid_at`.
+7. Synchronize invalidation metadata to ChromaDB; Neo4j remains the source of
+   truth during retrieval.
+
+The simulation activity prompt carries an exact timestamp and round on every
+source line. Extracted facts therefore preserve per-activity rounds even when a
+write batch spans multiple rounds.
+
+## Provenance schema
+
+```text
+(:Episode {
+  uuid, graph_id, content, source, source_description,
+  created_at, valid_at, round_num, platform, episode_metadata,
+  processed, entity_edges
+})-[:MENTIONS]->(:Entity)
+
+(:Entity)-[:RELATION {
+  uuid, graph_id, name, fact,
+  created_at, expired_at,
+  valid_at, invalid_at, reference_time,
+  round_num, episode_source, episodes
+}]->(:Entity)
+```
+
+`entity_edges` contains the derived relationship UUIDs. `episodes` supports
+many-to-one provenance when repeated evidence resolves to an existing fact.
+
+## Retrieval behavior
+
+Semantic search first retrieves a larger candidate set from ChromaDB, hydrates
+those edge IDs from Neo4j, and then applies event-time, transaction-time, range,
+and round filters. This prevents stale vector metadata from returning an
+invalidated fact as current.
+
+Available HTTP reads:
+
+| Endpoint | Important parameters |
 |---|---|
-| `services/zep_entity_reader.py` | Add `ZepEntityReader = LocalEntityReader` alias |
-| `services/graph_builder.py` | Add `GraphBuilderService = LocalGraphBuilderService` alias |
-| `services/zep_graph_memory_updater.py` | Alias to `LocalGraphMemoryUpdater` / `LocalGraphMemoryManager` |
-| `services/zep_tools.py` | Alias to `LocalToolsService` |
-| `services/oasis_profile_generator.py` | Remove `from zep_cloud.client import Zep` import + `self.zep_client` |
-| `config.py` | Add `NEO4J_URI/USER/PASSWORD`, `CHROMA_PERSIST_DIR`; remove `ZEP_API_KEY` |
-| `docker-compose.yml` | Add Neo4j `5-community` service |
-| `backend/requirements.txt` | Add `chromadb`, `rank-bm25`; remove `zep-cloud` |
-| `.env.example` | Replace `ZEP_API_KEY` with Neo4j vars |
+| `/api/graph/timeline/<graph_id>` | `start_time`, `end_time`, `entity_uuid`, `relation_type`, `round_from`, `round_to` |
+| `/api/graph/snapshot/<graph_id>` | required `as_of`, optional `known_at` |
+| `/api/graph/episodes/<graph_id>` | `start_time`, `end_time`, `limit` |
+| `/api/graph/data/<graph_id>` | `as_of`, `known_at`, `include_historical` |
 
----
+ReportAgent exposes the same capability through `timeline_search`.
 
-## Implementation Order
+## Compatibility and migration
 
-1. **Config + utilities** — `config.py`, `graph_db.py`, `vector_store.py`, `embedder.py`
-2. **Entity reader** — `local_entity_reader.py` → alias in `zep_entity_reader.py`
-3. **Graph builder** — `local_graph_builder.py` → alias in `graph_builder.py`
-4. **Memory updater** — `local_graph_memory_updater.py` → alias in `zep_graph_memory_updater.py`
-5. **Search tools** — `local_tools.py` → alias in `zep_tools.py`
-6. **Cleanup** — fix `oasis_profile_generator.py`, update docker-compose, remove zep-cloud
-7. **Test** — end-to-end graph build → simulation → report
+- `graph_builder.py`, `zep_entity_reader.py`, `zep_graph_memory_updater.py`, and
+  `zep_tools.py` are thin local aliases for older imports.
+- Startup creates Episode constraints/indexes and backfills temporal fields on
+  legacy local relationships.
+- Both `pyproject.toml` and `requirements.txt` declare all direct local graph
+  dependencies. `zep-cloud` is absent from both and from `uv.lock`.
+- Existing local graph IDs remain readable. Legacy relationships without
+  temporal fields receive conservative timestamps and provenance defaults.
 
----
+## Verification
 
-## Gotchas
-
-- **Existing Zep projects:** Add `graph_backend` field to project metadata. Show error for `"zep"` projects — they must be rebuilt.
-- **Neo4j dynamic rel types:** Cypher doesn't allow parameterized `[:$type]`. Validate rel type strings against the ontology before string-interpolating into queries.
-- **LLM extraction quality:** Use `temperature=0.1`, JSON mode, and instruct: *"only extract facts explicitly stated in the text."*
-- **Model cold start:** Initialize `SentenceTransformer` singleton at app startup in `__init__.py`, not lazily.
-- **ChromaDB scale:** Use a single collection with `graph_id` as metadata filter rather than one collection per graph.
-- **`invalid_at` conflict during search:** Neo4j snapshot isolation means a mid-update search sees relationships as active until commit — correct behaviour.
+Temporal unit tests live under `backend/tests/` and cover timestamp
+normalization, half-open intervals, event/transaction-time snapshots, round
+slices, exact duplicate provenance, recurrence, contradiction invalidation,
+backfilled facts, and explicit historical intervals.
