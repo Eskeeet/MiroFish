@@ -98,6 +98,24 @@ def ensure_constraints():
         run_write("CREATE INDEX entity_name IF NOT EXISTS FOR (n:Entity) ON (n.name)")
     except Exception as e:
         logger.debug(f"entity_name索引: {e}")
+    try:
+        run_write("CREATE CONSTRAINT episode_uuid IF NOT EXISTS FOR (n:Episode) REQUIRE n.uuid IS UNIQUE")
+    except Exception as e:
+        logger.debug(f"episode_uuid约束: {e}")
+    try:
+        run_write(
+            "CREATE INDEX episode_graph_valid IF NOT EXISTS "
+            "FOR (n:Episode) ON (n.graph_id, n.valid_at)"
+        )
+    except Exception as e:
+        logger.debug(f"episode_graph_valid索引: {e}")
+    try:
+        run_write(
+            "CREATE LOOKUP INDEX relationship_type IF NOT EXISTS "
+            "FOR ()-[r]-() ON EACH type(r)"
+        )
+    except Exception as e:
+        logger.debug(f"relationship_type查找索引: {e}")
     logger.info("Neo4j约束和索引已确认")
 
 

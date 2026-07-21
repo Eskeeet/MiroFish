@@ -59,6 +59,29 @@ def upsert_facts(facts: List[Dict[str, Any]]):
     logger.debug(f"ChromaDB upsert {len(facts)} 条事实")
 
 
+def update_fact_metadata(fact_id: str, updates: Dict[str, Any]):
+    """Merge temporal/provenance fields into an existing fact's metadata.
+
+    Neo4j is the source of truth, but keeping the Chroma copy synchronized
+    prevents invalidated facts from being presented as current during vector
+    retrieval.
+    """
+    if not fact_id or not updates:
+        return
+    collection = get_collection()
+    try:
+        current = collection.get(ids=[fact_id], include=["metadatas"])
+        if not current or not current.get("ids"):
+            return
+        metadata = dict((current.get("metadatas") or [{}])[0] or {})
+        for key, value in updates.items():
+            # Chroma metadata values must be scalar and cannot be None.
+            metadata[key] = "" if value is None else value
+        collection.update(ids=[fact_id], metadatas=[metadata])
+    except Exception as e:
+        logger.warning(f"更新事实 {fact_id} 的 ChromaDB 元数据失败: {e}")
+
+
 def semantic_search(
     query_embedding: List[float],
     graph_id: str,
