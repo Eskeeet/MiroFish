@@ -14,8 +14,6 @@ dependencies = [
     "flask-cors>=6.0.0",
     # LLM 相关
     "openai>=1.0.0",
-    # Zep Cloud
-    "zep-cloud==3.13.0",
     # OASIS 社交媒体模拟
     "camel-oasis==0.2.5",
     "camel-ai==0.2.78",
@@ -27,6 +25,8 @@ dependencies = [
     # 工具库
     "python-dotenv>=1.0.0",
     "pydantic>=2.0.0",
+    "neo4j>=5.0.0",
+    "sentence-transformers>=3.0.0",
     "chromadb>=1.5.5",
     "rank-bm25>=0.2.2",
 ]

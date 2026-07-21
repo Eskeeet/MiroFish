@@ -21,9 +21,13 @@ from openai import OpenAI
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, t
-from .zep_entity_reader import EntityNode, ZepEntityReader
+from .graph_models import EntityNode
+from .local_entity_reader import LocalEntityReader
 
 logger = get_logger('mirofish.simulation_config')
+
+# Backward-compatible local name used throughout this module.
+ZepEntityReader = LocalEntityReader
 
 # 中国作息时间配置（北京时间）
 CHINA_TIMEZONE_CONFIG = {
@@ -988,4 +992,3 @@ class SimulationConfigGenerator:
                 "influence_weight": 1.0
             }
     
-

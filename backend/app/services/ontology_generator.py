@@ -413,8 +413,18 @@ class OntologyGenerator:
             '由MiroFish自动生成，用于社会舆论模拟',
             '"""',
             '',
-            'from pydantic import Field',
-            'from zep_cloud.external_clients.ontology import EntityModel, EntityText, EdgeModel',
+            'from typing import Optional',
+            'from pydantic import BaseModel, Field',
+            '',
+            'EntityText = Optional[str]',
+            '',
+            'class EntityModel(BaseModel):',
+            '    """Local ontology entity base model."""',
+            '    pass',
+            '',
+            'class EdgeModel(BaseModel):',
+            '    """Local ontology relationship base model."""',
+            '    pass',
             '',
             '',
             '# ============== 实体类型定义 ==============',
@@ -503,4 +513,3 @@ class OntologyGenerator:
         code_lines.append('}')
         
         return '\n'.join(code_lines)
-

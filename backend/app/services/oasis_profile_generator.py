@@ -3,7 +3,7 @@ OASIS Agent Profile生成器
 将Zep图谱中的实体转换为OASIS模拟平台所需的Agent Profile格式
 
 优化改进：
-1. 调用Zep检索功能二次丰富节点信息
+1. 调用本地图谱检索二次丰富节点信息
 2. 优化提示词生成非常详细的人设
 3. 区分个人实体和抽象群体实体
 """
@@ -20,9 +20,12 @@ from openai import OpenAI
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.locale import get_language_instruction, get_locale, set_locale, t
-from .zep_entity_reader import EntityNode, ZepEntityReader
+from .graph_models import EntityNode
+from .local_entity_reader import LocalEntityReader
 
 logger = get_logger('mirofish.oasis_profile')
+
+ZepEntityReader = LocalEntityReader
 
 
 @dataclass
@@ -274,7 +277,7 @@ class OasisProfileGenerator:
         suffix = random.randint(100, 999)
         return f"{username}_{suffix}"
     
-    def _search_zep_for_entity(self, entity: EntityNode) -> Dict[str, Any]:
+    def _search_graph_for_entity(self, entity: EntityNode) -> Dict[str, Any]:
         """
         使用本地图谱搜索获取实体相关的丰富信息
         （原 Zep 云端搜索已替换为本地 ChromaDB + Neo4j 实现）
@@ -328,7 +331,7 @@ class OasisProfileGenerator:
         包括：
         1. 实体本身的边信息（事实）
         2. 关联节点的详细信息
-        3. Zep混合检索到的丰富信息
+        3. 本地图谱混合检索到的丰富信息
         """
         context_parts = []
         
@@ -382,17 +385,17 @@ class OasisProfileGenerator:
             if related_info:
                 context_parts.append("### 关联实体信息\n" + "\n".join(related_info))
         
-        # 4. 使用Zep混合检索获取更丰富的信息
-        zep_results = self._search_zep_for_entity(entity)
+        # 4. 使用本地图谱混合检索获取更丰富的信息
+        graph_results = self._search_graph_for_entity(entity)
         
-        if zep_results.get("facts"):
+        if graph_results.get("facts"):
             # 去重：排除已存在的事实
-            new_facts = [f for f in zep_results["facts"] if f not in existing_facts]
+            new_facts = [f for f in graph_results["facts"] if f not in existing_facts]
             if new_facts:
-                context_parts.append("### Zep检索到的事实信息\n" + "\n".join(f"- {f}" for f in new_facts[:15]))
+                context_parts.append("### 本地图谱检索到的事实信息\n" + "\n".join(f"- {f}" for f in new_facts[:15]))
         
-        if zep_results.get("node_summaries"):
-            context_parts.append("### Zep检索到的相关节点\n" + "\n".join(f"- {s}" for s in zep_results["node_summaries"][:10]))
+        if graph_results.get("node_summaries"):
+            context_parts.append("### 本地图谱检索到的相关节点\n" + "\n".join(f"- {s}" for s in graph_results["node_summaries"][:10]))
         
         return "\n\n".join(context_parts)
     
@@ -755,7 +758,7 @@ class OasisProfileGenerator:
             }
     
     def set_graph_id(self, graph_id: str):
-        """设置图谱ID用于Zep检索"""
+        """设置图谱ID用于本地图谱检索"""
         self.graph_id = graph_id
     
     def generate_profiles_from_entities(
@@ -775,7 +778,7 @@ class OasisProfileGenerator:
             entities: 实体列表
             use_llm: 是否使用LLM生成详细人设
             progress_callback: 进度回调函数 (current, total, message)
-            graph_id: 图谱ID，用于Zep检索获取更丰富上下文
+            graph_id: 图谱ID，用于本地图谱检索获取更丰富上下文
             parallel_count: 并行生成数量，默认5
             realtime_output_path: 实时写入的文件路径（如果提供，每生成一个就写入一次）
             output_platform: 输出平台格式 ("reddit" 或 "twitter")
@@ -786,7 +789,7 @@ class OasisProfileGenerator:
         import concurrent.futures
         from threading import Lock
         
-        # 设置graph_id用于Zep检索
+        # 设置graph_id用于本地图谱检索
         if graph_id:
             self.graph_id = graph_id
         

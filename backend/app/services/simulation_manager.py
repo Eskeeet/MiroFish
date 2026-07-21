@@ -14,12 +14,15 @@ from enum import Enum
 
 from ..config import Config
 from ..utils.logger import get_logger
-from .zep_entity_reader import ZepEntityReader, FilteredEntities
+from .graph_models import FilteredEntities
+from .local_entity_reader import LocalEntityReader
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 from .simulation_config_generator import SimulationConfigGenerator, SimulationParameters
 from ..utils.locale import t
 
 logger = get_logger('mirofish.simulation')
+
+ZepEntityReader = LocalEntityReader
 
 
 class SimulationStatus(str, Enum):
@@ -312,7 +315,7 @@ class SimulationManager:
                     total=total_entities
                 )
             
-            # 传入graph_id以启用Zep检索功能，获取更丰富的上下文
+            # 传入 graph_id 以启用本地图谱检索，获取更丰富的上下文
             generator = OasisProfileGenerator(graph_id=state.graph_id)
             
             def profile_progress(current, total, msg):
@@ -340,7 +343,7 @@ class SimulationManager:
                 entities=filtered.entities,
                 use_llm=use_llm_for_profiles,
                 progress_callback=profile_progress,
-                graph_id=state.graph_id,  # 传入graph_id用于Zep检索
+                graph_id=state.graph_id,  # 传入 graph_id 用于本地图谱检索
                 parallel_count=parallel_profile_count,  # 并行生成数量
                 realtime_output_path=realtime_output_path,  # 实时保存路径
                 output_platform=realtime_platform  # 输出格式
